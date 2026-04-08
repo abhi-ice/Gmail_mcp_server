@@ -1,0 +1,165 @@
+"""Pydantic input models for all Gmail MCP tools."""
+
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class AuthenticateInput(BaseModel):
+    alias: str = Field(
+        ...,
+        min_length=1,
+        max_length=30,
+        description="Friendly name for the account (e.g., 'company1'). Lowercase alphanumeric with hyphens only.",
+    )
+    email: str = Field(
+        ...,
+        description="Gmail address to authenticate (e.g., user@company1.com).",
+    )
+    description: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Human-readable description (e.g., 'Main construction company email').",
+    )
+
+    @field_validator("alias")
+    @classmethod
+    def alias_format(cls, v: str) -> str:
+        import re
+        if not re.match(r"^[a-z0-9][a-z0-9\-]*$", v):
+            raise ValueError("alias must be lowercase alphanumeric with hyphens only, and must start with a letter or digit")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def email_format(cls, v: str) -> str:
+        import re
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v):
+            raise ValueError("email must be a valid email address")
+        return v.lower().strip()
+
+
+class SearchEmailsInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias to search in (e.g., 'company1').",
+    )
+    query: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Gmail search query. Examples: "
+            "'from:client@example.com', "
+            "'subject:invoice after:2024/01/01', "
+            "'is:unread in:inbox', "
+            "'has:attachment label:important'."
+        ),
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of results to return (1–50, default 10).",
+    )
+
+
+class ReadEmailInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+    message_id: str = Field(
+        ...,
+        description="Email message ID from search results.",
+    )
+
+
+class DraftEmailInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias to create draft in.",
+    )
+    to: str = Field(
+        ...,
+        description="Recipient email address(es), comma-separated.",
+    )
+    subject: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Email subject line.",
+    )
+    body: str = Field(
+        ...,
+        min_length=1,
+        description="Email body text (plain text).",
+    )
+    cc: Optional[str] = Field(
+        None,
+        description="CC recipients, comma-separated.",
+    )
+    bcc: Optional[str] = Field(
+        None,
+        description="BCC recipients, comma-separated.",
+    )
+    reply_to_message_id: Optional[str] = Field(
+        None,
+        description="If this is a reply, provide the original message ID to set proper threading headers (In-Reply-To, References, threadId).",
+    )
+
+
+class EmailAction(str, Enum):
+    trash = "trash"
+    untrash = "untrash"
+    archive = "archive"
+    move_to_inbox = "move_to_inbox"
+    mark_read = "mark_read"
+    mark_unread = "mark_unread"
+    star = "star"
+    unstar = "unstar"
+
+
+class ModifyEmailInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+    message_id: str = Field(
+        ...,
+        description="Email message ID.",
+    )
+    action: EmailAction = Field(
+        ...,
+        description=(
+            "Action to perform. One of: 'trash', 'untrash', 'archive', 'move_to_inbox', "
+            "'mark_read', 'mark_unread', 'star', 'unstar'."
+        ),
+    )
+    add_labels: Optional[list[str]] = Field(
+        None,
+        description="Additional label names or IDs to add.",
+    )
+    remove_labels: Optional[list[str]] = Field(
+        None,
+        description="Label names or IDs to remove.",
+    )
+
+
+class ListLabelsInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+
+
+class SearchContactsInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="Name, email, or phone number to search for.",
+    )

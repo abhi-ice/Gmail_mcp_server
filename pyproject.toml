@@ -1,0 +1,19 @@
+[project]
+name = "gmail-mcp"
+version = "1.0.0"
+description = "Multi-account Gmail MCP server for Claude Desktop"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]",
+    "google-api-python-client>=2.100.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-auth-httplib2>=0.2.0",
+    "pydantic>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+gmail-mcp = "gmail_mcp.server:main"
