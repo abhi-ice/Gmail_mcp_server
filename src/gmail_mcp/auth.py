@@ -1,309 +1,303 @@
 """
-OAuth2 token manager for multi-account Gmail MCP server.
+OAuth2 + Google API service builders for the multi-tenant Gmail MCP server.
 
-Handles:
-- Per-account token storage at ~/.gmail-mcp/accounts/{alias}/token.json
-- Auto-refresh of expired tokens
-- Caching of Google API service objects
-- Thread-safe config reads/writes via atomic file replacement
+Per-user, per-account tokens live in SQLite (encrypted). On token refresh we
+write the new access token back to the DB so we don't keep refreshing on
+every request.
 """
 
+from __future__ import annotations
+
 import json
-import os
-import sys
-import tempfile
 import threading
 import time
-from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 from google.auth.transport.requests import Request  # type: ignore
 from google.oauth2.credentials import Credentials  # type: ignore
-from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
 from googleapiclient.discovery import build  # type: ignore
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.labels",
-    "https://www.googleapis.com/auth/contacts.readonly",
-]
+from . import storage
+from .config import (
+    SCOPES,
+    get_oauth_client_id,
+    get_oauth_client_secret,
+    get_oauth_redirect_uri,
+    log,
+)
 
-_BASE_DIR = Path.home() / ".gmail-mcp"
-_OAUTH_KEYS_PATH = _BASE_DIR / "oauth-keys.json"
-_CONFIG_PATH = _BASE_DIR / "config.json"
-_ACCOUNTS_DIR = _BASE_DIR / "accounts"
-
-# In-memory caches
-_service_cache: dict[str, Any] = {}          # alias → gmail service
-_people_service_cache: dict[str, Any] = {}   # alias → people service
-_label_cache: dict[str, dict] = {}           # alias → {"labels": [...], "fetched_at": float}
+# In-memory service caches keyed by (user_id, alias). LRU not strictly needed for 20 users.
+_service_cache: dict[tuple[str, str], Any] = {}
+_people_service_cache: dict[tuple[str, str], Any] = {}
+_label_cache: dict[tuple[str, str], dict] = {}
 _cache_lock = threading.Lock()
 
-LABEL_CACHE_TTL = 300  # seconds (5 minutes)
+LABEL_CACHE_TTL = 300  # seconds
 
 
-def _ensure_dirs() -> None:
-    """Create required directories if they don't exist."""
-    _BASE_DIR.mkdir(mode=0o700, exist_ok=True)
-    _ACCOUNTS_DIR.mkdir(mode=0o700, exist_ok=True)
+# ---------------------------------------------------------------------------
+# OAuth: building the consent URL
+# ---------------------------------------------------------------------------
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
-def _token_path(alias: str) -> Path:
-    return _ACCOUNTS_DIR / alias / "token.json"
-
-
-def _write_json_atomic(path: Path, data: dict) -> None:
-    """Write JSON atomically using a temp file + rename, so partial writes never corrupt data."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-_config_lock = threading.Lock()
-
-
-def load_config() -> dict:
-    """Load account config from disk. Returns empty config if file doesn't exist."""
-    _ensure_dirs()
-    if not _CONFIG_PATH.exists():
-        return {"accounts": {}}
-    with _config_lock:
-        try:
-            with open(_CONFIG_PATH, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[gmail-mcp] Warning: could not read config.json: {e}", file=sys.stderr)
-            return {"accounts": {}}
-
-
-def save_config(config: dict) -> None:
-    """Save account config to disk atomically."""
-    _ensure_dirs()
-    with _config_lock:
-        _write_json_atomic(_CONFIG_PATH, config)
-
-
-def get_credentials(alias: str) -> Credentials | None:
+def build_consent_url(state: str) -> str:
     """
-    Load credentials for an account alias, refreshing if expired.
-    Returns None if no token exists.
-    Raises RuntimeError if refresh fails (token revoked).
+    Build the Google OAuth consent URL. The user clicks this; Google calls
+    our /oauth/callback with the code on success.
     """
-    path = _token_path(alias)
-    if not path.exists():
+    params = {
+        "client_id": get_oauth_client_id(),
+        "redirect_uri": get_oauth_redirect_uri(),
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",  # force refresh_token to be issued every time
+        "state": state,
+        "include_granted_scopes": "true",
+    }
+    return f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+
+
+def exchange_code_for_tokens(code: str) -> dict:
+    """
+    Exchange an authorization code for tokens. Returns a dict matching what
+    google.oauth2.credentials.Credentials.to_json() produces (so existing code
+    that builds Credentials from this dict keeps working).
+    """
+    import httpx  # local import to keep cold start light
+
+    resp = httpx.post(
+        GOOGLE_TOKEN_URL,
+        data={
+            "code": code,
+            "client_id": get_oauth_client_id(),
+            "client_secret": get_oauth_client_secret(),
+            "redirect_uri": get_oauth_redirect_uri(),
+            "grant_type": "authorization_code",
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    # Normalise to the schema google-auth's Credentials expects
+    token_data = {
+        "token": payload.get("access_token"),
+        "refresh_token": payload.get("refresh_token"),
+        "token_uri": GOOGLE_TOKEN_URL,
+        "client_id": get_oauth_client_id(),
+        "client_secret": get_oauth_client_secret(),
+        "scopes": SCOPES,
+        "expiry": _expiry_iso(payload.get("expires_in", 3600)),
+    }
+    if not token_data["refresh_token"]:
+        raise RuntimeError(
+            "Google did not return a refresh_token. This usually means the user has "
+            "already granted access to this client — revoke it at "
+            "https://myaccount.google.com/permissions and try again."
+        )
+    return token_data
+
+
+def _expiry_iso(expires_in_seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Service builders
+# ---------------------------------------------------------------------------
+
+def _credentials_from_token_dict(token_data: dict) -> Credentials:
+    """Build a google-auth Credentials from a stored token dict."""
+    return Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", GOOGLE_TOKEN_URL),
+        client_id=token_data.get("client_id", get_oauth_client_id()),
+        client_secret=token_data.get("client_secret", get_oauth_client_secret()),
+        scopes=token_data.get("scopes", SCOPES),
+    )
+
+
+def _load_or_refresh(user_id: str, alias: str) -> Optional[Credentials]:
+    token_data = storage.get_account_token(user_id, alias)
+    if not token_data:
         return None
 
-    try:
-        creds = Credentials.from_authorized_user_file(str(path), SCOPES)
-    except Exception as e:
-        print(f"[gmail-mcp] Could not load token for '{alias}': {e}", file=sys.stderr)
-        return None
-
+    creds = _credentials_from_token_dict(token_data)
     if creds.valid:
         return creds
 
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            _write_json_atomic(path, json.loads(creds.to_json()))
-            print(f"[gmail-mcp] Token refreshed for account '{alias}'", file=sys.stderr)
-            return creds
         except Exception as e:
-            print(f"[gmail-mcp] Token refresh failed for '{alias}': {e}", file=sys.stderr)
+            log(f"Token refresh failed for user={user_id} alias={alias}: {e}")
             raise RuntimeError(
                 f"Token refresh failed for account '{alias}'. "
-                f"Please re-authenticate using: gmail_authenticate(alias='{alias}', email='...')"
+                f"Please re-authenticate using gmail_authenticate."
             ) from e
+        # Persist refreshed token
+        updated = json.loads(creds.to_json())
+        # Preserve client_id/secret (creds.to_json() omits the secret)
+        updated["client_secret"] = get_oauth_client_secret()
+        storage.update_account_token(user_id, alias, updated)
+        return creds
 
     return None
 
 
-def authenticate_account(alias: str, email: str, description: Optional[str] = None) -> str:
-    """
-    Run the OAuth2 installed-app flow for a Gmail account.
-    Opens a browser window for Google sign-in.
-    Saves token and updates config on success.
-    Returns success message string.
-    """
-    _ensure_dirs()
-
-    if not _OAUTH_KEYS_PATH.exists():
-        raise FileNotFoundError(
-            f"OAuth keys file not found at {_OAUTH_KEYS_PATH}. "
-            "Please download your OAuth 2.0 Client ID credentials from Google Cloud Console "
-            "and save them as ~/.gmail-mcp/oauth-keys.json. "
-            "See the README for detailed setup instructions."
-        )
-
-    try:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(_OAUTH_KEYS_PATH),
-            scopes=SCOPES,
-        )
-        creds = flow.run_local_server(port=0)
-    except Exception as e:
-        raise RuntimeError(f"OAuth flow failed: {e}") from e
-
-    # Save token
-    token_path = _token_path(alias)
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(token_path, json.loads(creds.to_json()))
-    print(f"[gmail-mcp] Token saved for account '{alias}' at {token_path}", file=sys.stderr)
-
-    # Update config
-    config = load_config()
-    config.setdefault("accounts", {})[alias] = {
-        "email": email,
-        "description": description or "",
-    }
-    save_config(config)
-
-    # Invalidate service cache for this alias
+def get_gmail_service(user_id: str, alias: str):
+    """Return a Gmail API service for (user, alias). Raises if not authenticated."""
+    key = (user_id, alias)
     with _cache_lock:
-        _service_cache.pop(alias, None)
-        _people_service_cache.pop(alias, None)
-        _label_cache.pop(alias, None)
-
-    return f"Successfully authenticated account '{alias}' ({email})."
-
-
-def get_gmail_service(alias: str):
-    """
-    Return a cached Gmail API service object for the given account alias.
-    Builds a new one if not cached or if credentials need refreshing.
-    """
-    with _cache_lock:
-        svc = _service_cache.get(alias)
+        svc = _service_cache.get(key)
         if svc is not None:
             return svc
 
-    creds = get_credentials(alias)
+    creds = _load_or_refresh(user_id, alias)
     if creds is None:
         raise RuntimeError(
             f"No credentials found for account '{alias}'. "
             f"Use gmail_authenticate to authenticate this account first."
         )
 
-    service = build("gmail", "v1", credentials=creds)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     with _cache_lock:
-        _service_cache[alias] = service
+        _service_cache[key] = service
     return service
 
 
-def get_people_service(alias: str):
-    """
-    Return a cached Google People API service object for the given account alias.
-    """
+def get_people_service(user_id: str, alias: str):
+    key = (user_id, alias)
     with _cache_lock:
-        svc = _people_service_cache.get(alias)
+        svc = _people_service_cache.get(key)
         if svc is not None:
             return svc
 
-    creds = get_credentials(alias)
+    creds = _load_or_refresh(user_id, alias)
     if creds is None:
         raise RuntimeError(
             f"No credentials found for account '{alias}'. "
             f"Use gmail_authenticate to authenticate this account first."
         )
 
-    service = build("people", "v1", credentials=creds)
+    service = build("people", "v1", credentials=creds, cache_discovery=False)
     with _cache_lock:
-        _people_service_cache[alias] = service
+        _people_service_cache[key] = service
     return service
 
 
-def get_label_cache(alias: str, force_refresh: bool = False) -> list[dict]:
-    """
-    Return the cached label list for an account. Fetches from API if stale or missing.
-    Cache TTL: 5 minutes.
-    """
+def invalidate_caches(user_id: str, alias: str) -> None:
+    key = (user_id, alias)
+    with _cache_lock:
+        _service_cache.pop(key, None)
+        _people_service_cache.pop(key, None)
+        _label_cache.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Label cache (per user+alias)
+# ---------------------------------------------------------------------------
+
+def get_label_cache(user_id: str, alias: str, force_refresh: bool = False) -> list[dict]:
+    key = (user_id, alias)
     now = time.monotonic()
     with _cache_lock:
-        cached = _label_cache.get(alias)
+        cached = _label_cache.get(key)
         if cached and not force_refresh:
-            age = now - cached["fetched_at"]
-            if age < LABEL_CACHE_TTL:
+            if now - cached["fetched_at"] < LABEL_CACHE_TTL:
                 return cached["labels"]
 
-    # Fetch fresh labels
-    service = get_gmail_service(alias)
+    service = get_gmail_service(user_id, alias)
     result = service.users().labels().list(userId="me").execute()
     labels = result.get("labels", [])
 
     with _cache_lock:
-        _label_cache[alias] = {"labels": labels, "fetched_at": time.monotonic()}
-
+        _label_cache[key] = {"labels": labels, "fetched_at": time.monotonic()}
     return labels
 
 
-def invalidate_label_cache(alias: str) -> None:
-    """Force-invalidate the label cache for an account."""
-    with _cache_lock:
-        _label_cache.pop(alias, None)
-
-
-def resolve_label_ids_to_names(alias: str, label_ids: list[str]) -> list[str]:
-    """Convert a list of label IDs to human-readable label names."""
-    labels = get_label_cache(alias)
+def resolve_label_ids_to_names(user_id: str, alias: str, label_ids: list[str]) -> list[str]:
+    labels = get_label_cache(user_id, alias)
     id_to_name = {lbl["id"]: lbl["name"] for lbl in labels}
     return [id_to_name.get(lid, lid) for lid in label_ids]
 
 
-def resolve_label_names_to_ids(alias: str, label_names: list[str]) -> list[str]:
-    """
-    Convert label names to IDs.
-    If a value already looks like an ID (all uppercase or starts with 'Label_'), pass through.
-    """
-    labels = get_label_cache(alias)
+def resolve_label_names_to_ids(user_id: str, alias: str, label_names: list[str]) -> list[str]:
+    labels = get_label_cache(user_id, alias)
     name_to_id = {lbl["name"].lower(): lbl["id"] for lbl in labels}
     result = []
+    SYSTEM = {
+        "INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT",
+        "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES", "CATEGORY_FORUMS",
+    }
     for name in label_names:
-        # System labels are already their own IDs
-        if name.upper() in {
-            "INBOX", "SENT", "DRAFT", "TRASH", "SPAM", "STARRED", "IMPORTANT",
-            "UNREAD", "CATEGORY_PERSONAL", "CATEGORY_SOCIAL", "CATEGORY_PROMOTIONS",
-            "CATEGORY_UPDATES", "CATEGORY_FORUMS",
-        }:
+        if name.upper() in SYSTEM:
             result.append(name.upper())
         elif name.startswith("Label_"):
             result.append(name)
         else:
             resolved = name_to_id.get(name.lower())
-            if resolved:
-                result.append(resolved)
-            else:
-                # Pass through as-is and let the API reject it if invalid
-                result.append(name)
+            result.append(resolved if resolved else name)
     return result
 
 
-def check_auth_status(alias: str) -> dict:
-    """
-    Check if an account has valid credentials.
-    Returns dict with 'authenticated' bool and 'status' string.
-    """
-    path = _token_path(alias)
-    if not path.exists():
-        return {"authenticated": False, "status": "No token file found"}
+# ---------------------------------------------------------------------------
+# Initiating the OAuth flow (called by the gmail_authenticate tool)
+# ---------------------------------------------------------------------------
 
+def start_oauth_flow(user_id: str, alias: str, email: str, description: Optional[str]) -> str:
+    """
+    Create a state token and return the Google consent URL the user should click.
+    """
+    state = storage.create_oauth_state(user_id, alias, email, description)
+    return build_consent_url(state)
+
+
+def complete_oauth_flow(state: str, code: str) -> dict:
+    """
+    Called by the /oauth/callback HTTP handler. Returns the (alias, email) that
+    was just authenticated.
+    """
+    ctx = storage.consume_oauth_state(state)
+    if ctx is None:
+        raise RuntimeError("OAuth state token is invalid or has expired. Please start over.")
+
+    token_data = exchange_code_for_tokens(code)
+    storage.save_account(
+        user_id=ctx["user_id"],
+        alias=ctx["alias"],
+        email=ctx["email"],
+        description=ctx["description"],
+        token_json=token_data,
+    )
+    invalidate_caches(ctx["user_id"], ctx["alias"])
+    log(f"OAuth complete for user={ctx['user_id']} alias={ctx['alias']}")
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# Status helper
+# ---------------------------------------------------------------------------
+
+def check_auth_status(user_id: str, alias: str) -> dict:
+    token_data = storage.get_account_token(user_id, alias)
+    if not token_data:
+        return {"authenticated": False, "status": "Not authenticated"}
     try:
-        creds = Credentials.from_authorized_user_file(str(path), SCOPES)
+        creds = _credentials_from_token_dict(token_data)
     except Exception:
-        return {"authenticated": False, "status": "Token file is invalid or corrupt"}
+        return {"authenticated": False, "status": "Stored token is invalid"}
 
     if creds.valid:
         return {"authenticated": True, "status": "Authenticated"}
     if creds.expired and creds.refresh_token:
-        return {"authenticated": True, "status": "Token expired (will auto-refresh on next use)"}
-    return {"authenticated": False, "status": "Token expired and no refresh token — re-authentication required"}
+        return {"authenticated": True, "status": "Token expired (auto-refresh on next use)"}
+    return {"authenticated": False, "status": "Re-authentication required"}

@@ -1,0 +1,26 @@
+# systemd unit for running gmail-mcp directly (non-Docker option).
+# Place at /etc/systemd/system/gmail-mcp.service and adjust paths.
+
+[Unit]
+Description=Gmail MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=gmail-mcp
+Group=gmail-mcp
+WorkingDirectory=/opt/gmail-mcp
+EnvironmentFile=/opt/gmail-mcp/.env
+ExecStart=/opt/gmail-mcp/venv/bin/gmail-mcp
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gmail-mcp/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,18 +1,10 @@
-"""
-Google People API wrapper for contact search.
-"""
-
-import sys
+"""Google People API wrapper for contact search."""
 
 from .auth import get_people_service
 
 
-def search_contacts(alias: str, query: str) -> list[dict]:
-    """
-    Search contacts using Google People API.
-    Returns list of contact dicts with name, emails, phones, organization.
-    """
-    service = get_people_service(alias)
+def search_contacts(user_id: str, alias: str, query: str) -> list[dict]:
+    service = get_people_service(user_id, alias)
 
     result = (
         service.people()
@@ -23,29 +15,23 @@ def search_contacts(alias: str, query: str) -> list[dict]:
         .execute()
     )
 
-    results = result.get("results", [])
     contacts = []
-
-    for item in results:
+    for item in result.get("results", []):
         person = item.get("person", {})
 
-        # Extract name
         names = person.get("names", [])
         display_name = names[0].get("displayName", "") if names else ""
 
-        # Extract email addresses
         email_addrs = [
             e.get("value", "") for e in person.get("emailAddresses", []) if e.get("value")
         ]
 
-        # Extract phone numbers
         phones = [
             {"number": p.get("value", ""), "type": p.get("type", "")}
             for p in person.get("phoneNumbers", [])
             if p.get("value")
         ]
 
-        # Extract organization
         orgs = person.get("organizations", [])
         org_name = orgs[0].get("name", "") if orgs else ""
         org_title = orgs[0].get("title", "") if orgs else ""

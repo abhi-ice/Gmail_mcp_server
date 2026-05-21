@@ -1,0 +1,21 @@
+services:
+  gmail-mcp:
+    build: .
+    container_name: gmail-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GMAIL_MCP_TRANSPORT: http
+      GMAIL_MCP_HTTP_HOST: 0.0.0.0
+      GMAIL_MCP_HTTP_PORT: 8765
+      GMAIL_MCP_DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

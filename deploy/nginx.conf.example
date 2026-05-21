@@ -1,0 +1,47 @@
+# nginx site config for gmail-mcp
+# Place in /etc/nginx/sites-available/gmail-mcp and symlink to sites-enabled.
+# Replace gmail-mcp.example.com with your actual domain.
+
+server {
+    listen 80;
+    server_name gmail-mcp.example.com;
+
+    # certbot will replace this block automatically once TLS is set up.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name gmail-mcp.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/gmail-mcp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/gmail-mcp.example.com/privkey.pem;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    client_max_body_size 25M;  # PDF attachments
+
+    location / {
+        proxy_pass         http://127.0.0.1:8765;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # MCP streamable-HTTP needs long-lived connections + flushing
+        proxy_buffering    off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

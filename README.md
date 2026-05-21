@@ -1,257 +1,145 @@
-# Gmail MCP Server
+# Gmail MCP Server (v2 — multi-tenant)
 
-A production-grade, multi-account Gmail MCP server for Claude Desktop. It gives Claude access to multiple Gmail accounts simultaneously through a single local server instance — perfect for managing several company email accounts without switching contexts. The server communicates via stdio transport, runs entirely on your machine, and **never sends email**: it only creates drafts for your review.
+A Gmail MCP server you can host once and share with your whole team. Each user authenticates with their own bearer token; their Gmail accounts and OAuth tokens are completely isolated from every other user's. No local Python install needed for end users — they just paste a config snippet into Claude Desktop.
 
----
+Two modes:
 
-## Prerequisites
-
-- **Python 3.10+** installed on your system
-- A **Google Cloud project** with the **Gmail API** and **People API** enabled
-- An **OAuth 2.0 Client ID** (Desktop application type) downloaded from Google Cloud Console
-- **Claude Desktop** (Mac or Windows)
+| Mode | Transport | When |
+|---|---|---|
+| **stdio** | local | Solo developer running it on their own laptop. No bearer auth. |
+| **http**  | remote streamable-HTTP | Hosted on a VPS. Each user has a bearer token. Multi-tenant. |
 
 ---
 
-## Installation
+## What changed from v1
 
-### 1. Clone / download the project
+- **Multi-tenant**: every user is identified by an `Authorization: Bearer` token on every request. They only see their own connected Gmail accounts.
+- **SQLite storage** at `$GMAIL_MCP_DATA_DIR/data.db`. Refresh tokens are encrypted with Fernet (key in env).
+- **Remote OAuth flow**: `gmail_authenticate` now returns a URL to click. Google redirects to `/oauth/callback` on the server. No more spawning local HTTP servers on the user's laptop.
+- **New tool**: `gmail_download_attachment` for fetching PDF/DOCX/image bytes by attachment ID.
+- **Admin CLI**: `gmail-mcp-admin` for creating/revoking/rotating user tokens.
+- **Deploy story**: Dockerfile, docker-compose, systemd unit, nginx config, full [DEPLOYMENT.md](DEPLOYMENT.md).
+
+---
+
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `gmail_list_accounts` | List the calling user's connected Gmail accounts |
+| `gmail_authenticate` | Start OAuth flow for a new Gmail account (returns clickable URL) |
+| `gmail_search_emails` | Gmail query syntax search |
+| `gmail_read_email` | Body + headers + attachment metadata (with attachment IDs) |
+| `gmail_download_attachment` | Download attachment bytes to disk |
+| `gmail_draft_email` | Create draft (never sends) |
+| `gmail_modify_email` | Trash, archive, label, star, mark read/unread |
+| `gmail_list_labels` | List all labels with counts |
+| `gmail_search_contacts` | Google People API search |
+
+All tools take an `account` parameter — the alias of one of *your* connected Gmail accounts. Two users can both have `account="work"` pointing at completely different inboxes.
+
+---
+
+## Quick start — hosted deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full 10-step runbook (Hostinger VPS + nginx + Let's Encrypt + Google Cloud Console).
+
+TL;DR:
+1. DNS — point a subdomain at your VPS.
+2. Google Cloud Console — add `https://your-domain/oauth/callback` as an authorized redirect URI; add team emails as Test users.
+3. VPS — install, copy `.env.example` → `.env`, fill in values, start with systemd or docker-compose.
+4. `gmail-mcp-admin user-create --email <user>@<domain>` for each team member.
+5. Send each user the printed Claude Desktop config snippet.
+
+---
+
+## Quick start — local stdio mode
+
+For solo development on your own machine:
 
 ```bash
-git clone <repo-url> gmail-mcp
-cd gmail-mcp
-```
-
-### 2. Install the package
-
-```bash
+git clone https://github.com/Abhinandan7619/GmailMcp.git
+cd GmailMcp
+python -m venv venv
+source venv/bin/activate              # Windows: venv\Scripts\activate
 pip install -e .
+
+# Generate an encryption key
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# Create .env
+cat > .env <<EOF
+GMAIL_MCP_TRANSPORT=stdio
+GMAIL_MCP_ENCRYPTION_KEY=<paste the key above>
+GMAIL_MCP_OAUTH_CLIENT_ID=<from Google Cloud Console>
+GMAIL_MCP_OAUTH_CLIENT_SECRET=<from Google Cloud Console>
+GMAIL_MCP_OAUTH_REDIRECT_URI=http://localhost:8765/oauth/callback
+EOF
 ```
 
-This installs the `gmail-mcp` command and all dependencies (`mcp[cli]`, Google API client libraries, Pydantic).
-
-### 3. Create the credentials directory
-
-```bash
-mkdir -p ~/.gmail-mcp
-chmod 700 ~/.gmail-mcp
-```
-
----
-
-## Google Cloud OAuth Setup
-
-### Step 1 — Create or open a Google Cloud project
-
-1. Go to [https://console.cloud.google.com](https://console.cloud.google.com)
-2. Click the project dropdown at the top → **New Project**
-3. Name it (e.g., "Gmail MCP") and click **Create**
-
-### Step 2 — Enable required APIs
-
-1. In the left sidebar go to **APIs & Services → Library**
-2. Search for **Gmail API** → click it → click **Enable**
-3. Search for **People API** → click it → click **Enable**
-
-### Step 3 — Configure the OAuth consent screen
-
-1. Go to **APIs & Services → OAuth consent screen**
-2. Select **External** (or Internal if using Google Workspace)
-3. Fill in the required fields:
-   - App name: `Gmail MCP`
-   - User support email: your email
-   - Developer contact: your email
-4. Click **Save and Continue**
-5. On the **Scopes** page, click **Save and Continue** (scopes are requested at runtime)
-6. On the **Test users** page, add each Gmail address you plan to authenticate
-7. Click **Save and Continue**
-
-### Step 4 — Create OAuth credentials
-
-1. Go to **APIs & Services → Credentials**
-2. Click **+ Create Credentials → OAuth client ID**
-3. Application type: **Desktop app**
-4. Name: `Gmail MCP Desktop Client`
-5. Click **Create**
-6. Click **Download JSON** on the confirmation dialog (or download icon next to the credential)
-7. Save the file as:
-
-```
-~/.gmail-mcp/oauth-keys.json
-```
-
-```bash
-chmod 600 ~/.gmail-mcp/oauth-keys.json
-```
-
----
-
-## Claude Desktop Configuration
-
-Open your Claude Desktop config file:
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-
-Add the following (replace the path to match your installation):
-
+Add to Claude Desktop config:
 ```json
 {
   "mcpServers": {
     "gmail": {
-      "command": "python",
-      "args": ["-m", "gmail_mcp.server"],
-      "cwd": "/path/to/gmail-mcp/src"
+      "command": "/full/path/to/venv/bin/gmail-mcp"
     }
   }
 }
 ```
 
-**Important:** Replace `/path/to/gmail-mcp/src` with the actual absolute path to the `src/` directory inside your cloned repo.
-
-If you installed with `pip install -e .`, you can also use the installed script:
-
-```json
-{
-  "mcpServers": {
-    "gmail": {
-      "command": "gmail-mcp"
-    }
-  }
-}
-```
-
-Restart Claude Desktop after saving the config.
+In stdio mode an implicit `local-dev` user is used — no bearer token needed.
 
 ---
 
-## Authenticating Accounts
-
-Once Claude Desktop is running with the server configured, ask Claude to authenticate each account:
+## Architecture
 
 ```
-Authenticate my Gmail account with alias "company1", email "owner@company1.com",
-description "Main construction company"
-```
-
-This will call `gmail_authenticate` which opens your default browser for Google OAuth sign-in. After signing in, the token is saved to `~/.gmail-mcp/accounts/company1/token.json`.
-
-Repeat for each account:
-
-```
-gmail_authenticate(alias="company2", email="owner@company2.com", description="Site office")
-gmail_authenticate(alias="company3", email="accounts@company3.com", description="Accounts payable")
-```
-
-**Alias rules:** lowercase letters, numbers, and hyphens only (e.g., `company1`, `site-office`, `accounts`).
-
-Check your accounts any time:
-
-```
-gmail_list_accounts
+Claude Desktop
+    │
+    │ stdio: spawns gmail-mcp directly
+    │ http:  npx mcp-remote → HTTPS → nginx → uvicorn
+    │
+    ▼
+gmail-mcp (FastMCP)
+    │ ├── BearerAuthMiddleware (http only) — validates token, sets user context
+    │ ├── /oauth/callback                   — Google → back to us
+    │ └── /mcp                              — MCP streamable-HTTP endpoint
+    │
+    ▼
+SQLite (data.db)
+    users        (bearer_token_hash SHA256, revoked_at, is_admin)
+    user_accounts (user_id, alias, email, token_encrypted Fernet)
+    oauth_states  (state token, user_id, alias, 10-min TTL)
 ```
 
 ---
 
-## Available Tools
+## Security model
 
-| Tool | Description |
-|------|-------------|
-| `gmail_list_accounts` | Show all connected accounts and their auth status |
-| `gmail_authenticate` | Add or re-authenticate a Gmail account (opens browser) |
-| `gmail_search_emails` | Search emails using Gmail query syntax |
-| `gmail_read_email` | Read a full email including body and attachment info |
-| `gmail_draft_email` | Create a draft email (never sends — drafts only) |
-| `gmail_modify_email` | Trash, archive, star, mark read/unread, apply labels |
-| `gmail_list_labels` | List all labels/folders with message counts |
-| `gmail_search_contacts` | Search Google Contacts by name, email, or phone |
+| Surface | Mitigation |
+|---|---|
+| Bearer tokens at rest | Stored as SHA256 hash. Plaintext shown once at issuance. |
+| Refresh tokens at rest | Fernet-encrypted (AES-128-CBC + HMAC) with key from env. |
+| Path traversal in attachment downloads | `os.path.basename(filename)` strips path components. |
+| Cross-user data access | Every tool reads `user_id` from contextvar — never from a tool parameter. Storage queries are always `WHERE user_id = ?`. |
+| OAuth CSRF | Short-lived (10 min) single-use state tokens stored server-side. |
+| Transport | nginx terminates TLS via Let's Encrypt. Bearer tokens never sent over plaintext. |
 
-### Example queries
-
-```
-# Search for unread invoices in the accounts inbox
-gmail_search_emails(account="accounts", query="subject:invoice is:unread")
-
-# Read a specific email
-gmail_read_email(account="company1", message_id="18d3f2a1b2c3d4e5")
-
-# Draft a reply
-gmail_draft_email(
-    account="company1",
-    to="contractor@example.com",
-    subject="Re: Quote for Site 4",
-    body="Thank you for the quote...",
-    reply_to_message_id="18d3f2a1b2c3d4e5"
-)
-
-# Archive an email
-gmail_modify_email(account="company1", message_id="18d3f2a1b2c3d4e5", action="archive")
-
-# Search contacts
-gmail_search_contacts(account="company1", query="Smith Concrete")
-```
+What this does **not** protect against:
+- Compromise of the VPS itself (an attacker with root can read the encryption key from `.env` and decrypt all tokens). Use disk encryption + restricted SSH access.
+- Malicious admin (anyone with `gmail-mcp-admin` access can issue tokens or revoke users).
 
 ---
 
-## Credential Storage
+## Updating
 
-All credentials are stored locally on your machine under `~/.gmail-mcp/`:
+Server: `git pull && pip install -e . && sudo systemctl restart gmail-mcp`
 
-```
-~/.gmail-mcp/
-├── oauth-keys.json           # Google Cloud OAuth client credentials (you provide this)
-├── config.json               # Account aliases → email mapping (auto-managed)
-└── accounts/
-    ├── company1/
-    │   └── token.json        # OAuth token (auto-managed, permissions 0o600)
-    └── company2/
-        └── token.json
-```
-
-Token files are created with `0o600` permissions (owner read/write only). The server never transmits credentials anywhere.
+User-side: no action.
 
 ---
 
-## Troubleshooting
+## License
 
-### "OAuth keys file not found"
-
-The file `~/.gmail-mcp/oauth-keys.json` is missing. Download your OAuth Client ID JSON from Google Cloud Console → **APIs & Services → Credentials** and save it there.
-
-### "Token expired and no refresh token — re-authentication required"
-
-Your OAuth token has been revoked or expired without a refresh token. Re-authenticate the affected account:
-
-```
-gmail_authenticate(alias="company1", email="owner@company1.com")
-```
-
-### "Rate limited by Gmail API — please wait a minute and try again"
-
-You've hit Gmail API quota limits. Wait 60 seconds and retry. If this happens frequently, check your quota usage in Google Cloud Console → **APIs & Services → Gmail API → Quotas**.
-
-### "Permission denied"
-
-The OAuth token doesn't have the required scopes. This can happen if you added accounts before the full scope list was configured. Re-authenticate the account to get a fresh token with all required scopes.
-
-### Server doesn't appear in Claude Desktop
-
-1. Verify the `cwd` path in your Claude Desktop config is correct and the directory exists
-2. Check that Python 3.10+ is available at the `command` path you specified
-3. Restart Claude Desktop completely (quit from the tray/menu bar, not just close the window)
-4. Check Claude Desktop logs for MCP connection errors
-
-### Browser doesn't open during authentication
-
-The OAuth flow uses `localhost` redirect. Make sure:
-- You're running the server on the same machine as your browser
-- No firewall blocks localhost connections
-- If running in a headless environment, the OAuth flow cannot proceed — it requires a GUI browser
-
----
-
-## Security Notes
-
-- **No send capability**: The server uses `gmail.modify` and `gmail.compose` scopes, deliberately excluding `gmail.send`. Emails are only created as drafts.
-- **Local only**: The server runs as a local process. No data leaves your machine except for direct Google API calls.
-- **Token security**: Token files are stored with `0o600` permissions. Never commit `~/.gmail-mcp/` to version control.
-- **Credential isolation**: Each account has its own token file. A revoked token for one account does not affect others.
+MIT
