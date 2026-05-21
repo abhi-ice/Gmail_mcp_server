@@ -4,9 +4,11 @@ All public functions take an account alias and call through the auth module.
 """
 
 import base64
+import os
 import sys
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from pathlib import Path
 from typing import Optional
 
 from .auth import (
@@ -256,6 +258,54 @@ def modify_email(
         "message_id": message_id,
         "action": action,
         "labels": updated_label_names,
+    }
+
+
+def download_attachment(
+    alias: str,
+    message_id: str,
+    attachment_id: str,
+    filename: str,
+    save_dir: Optional[str] = None,
+) -> dict:
+    """
+    Download a single attachment to disk by attachment ID.
+    Returns dict with keys: path, filename, size_bytes.
+    Overwrites if a file with the same name already exists in save_dir.
+    """
+    service = get_gmail_service(alias)
+
+    result = (
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
+
+    data = result.get("data", "")
+    if not data:
+        raise RuntimeError(
+            "Attachment returned no data. The attachment_id may be invalid or the attachment may be empty."
+        )
+
+    padded = data + "=" * (-len(data) % 4)
+    binary = base64.urlsafe_b64decode(padded)
+
+    safe_name = os.path.basename(filename).strip()
+    if not safe_name or safe_name in (".", ".."):
+        raise ValueError("filename is invalid after sanitization.")
+
+    target_dir = Path(save_dir).expanduser().resolve() if save_dir else Path.cwd()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    target_path = target_dir / safe_name
+    target_path.write_bytes(binary)
+
+    return {
+        "path": str(target_path),
+        "filename": safe_name,
+        "size_bytes": len(binary),
     }
 
 

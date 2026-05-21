@@ -14,6 +14,7 @@ from . import gmail_client
 from . import contacts_client
 from .models import (
     AuthenticateInput,
+    DownloadAttachmentInput,
     DraftEmailInput,
     ListLabelsInput,
     ModifyEmailInput,
@@ -21,7 +22,7 @@ from .models import (
     SearchContactsInput,
     SearchEmailsInput,
 )
-from .utils import handle_api_error, validate_account_alias
+from .utils import format_size, handle_api_error, validate_account_alias
 
 mcp = FastMCP("gmail_mcp")
 
@@ -264,6 +265,12 @@ async def gmail_read_email(account: str, message_id: str) -> str:
                 lines.append(
                     f"  • {att['filename']} ({att['mimeType']}, {att['size']})"
                 )
+                if att.get("attachmentId"):
+                    lines.append(f"    Attachment ID: `{att['attachmentId']}`")
+            lines.append("")
+            lines.append(
+                "_To download: use `gmail_download_attachment` with the Message ID, Attachment ID, and filename above._"
+            )
 
         return "\n".join(lines)
 
@@ -597,6 +604,79 @@ async def gmail_search_contacts(account: str, query: str) -> str:
         return str(e)
     except Exception as e:
         print(f"[gmail-mcp] gmail_search_contacts error: {e}", file=sys.stderr)
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 9: gmail_download_attachment
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="gmail_download_attachment",
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def gmail_download_attachment(
+    account: str,
+    message_id: str,
+    attachment_id: str,
+    filename: str,
+    save_dir: str = "",
+) -> str:
+    """
+    Download an email attachment (PDF, DOCX, image, etc.) to local disk.
+    Use the Message ID and Attachment ID shown in gmail_read_email's output.
+    Overwrites if a file with the same name already exists in save_dir.
+
+    Args:
+        account: Account alias.
+        message_id: Email message ID.
+        attachment_id: Attachment ID from gmail_read_email output.
+        filename: Filename to save as. Path components are stripped for safety.
+        save_dir: Directory to save into. Defaults to the server's working directory.
+    """
+    try:
+        validated = DownloadAttachmentInput(
+            account=account,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            filename=filename,
+            save_dir=save_dir if save_dir else None,
+        )
+
+        config = auth.load_config()
+        err = validate_account_alias(validated.account, config)
+        if err:
+            return err
+
+        result = gmail_client.download_attachment(
+            alias=validated.account,
+            message_id=validated.message_id,
+            attachment_id=validated.attachment_id,
+            filename=validated.filename,
+            save_dir=validated.save_dir,
+        )
+
+        lines = [
+            "## Attachment Downloaded",
+            "",
+            f"**Saved to:** `{result['path']}`",
+            f"**Filename:** {result['filename']}",
+            f"**Size:**     {format_size(result['size_bytes'])}",
+        ]
+
+        return "\n".join(lines)
+
+    except ValueError as e:
+        return f"Invalid input: {e}"
+    except RuntimeError as e:
+        return str(e)
+    except Exception as e:
+        print(f"[gmail-mcp] gmail_download_attachment error: {e}", file=sys.stderr)
         return handle_api_error(e)
 
 

@@ -163,3 +163,30 @@ class SearchContactsInput(BaseModel):
         min_length=1,
         description="Name, email, or phone number to search for.",
     )
+
+
+class DownloadAttachmentInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+    message_id: str = Field(
+        ...,
+        min_length=1,
+        description="Email message ID (from gmail_search_emails or gmail_read_email).",
+    )
+    attachment_id: str = Field(
+        ...,
+        min_length=1,
+        description="Attachment ID (from gmail_read_email output).",
+    )
+    filename: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Filename to save the attachment as. Path components are stripped for safety.",
+    )
+    save_dir: Optional[str] = Field(
+        None,
+        description="Directory to save the attachment into. Defaults to the server's current working directory if not provided.",
+    )
