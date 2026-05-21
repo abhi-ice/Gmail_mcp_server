@@ -1,29 +1,31 @@
-# Gmail MCP — Deployment Runbook
+# Gmail MCP — Deployment Runbook (v3)
 
-End-to-end setup for the multi-tenant remote deployment on a Hostinger VPS (or any Linux box). Estimated time: 60–90 minutes including domain/DNS propagation.
+End-to-end setup for a single Hostinger VPS (or any Linux box). After deploy, **every user in your org pastes the same config snippet** — they sign in via Google in the browser, no admin token issuance needed.
+
+Estimated time: 60–90 minutes (most of it DNS + Let's Encrypt).
 
 ---
 
 ## Prerequisites checklist
 
-- [ ] A domain (or subdomain) you control — e.g. `gmail-mcp.ice.com`
-- [ ] A Hostinger VPS (KVM 2 plan is plenty for ~20 users) running Ubuntu 22.04 or 24.04
-- [ ] Root or sudo access on the VPS
+- [ ] A domain or subdomain — e.g. `gmail-mcp.ice.com`
+- [ ] A Hostinger VPS (KVM 2 is plenty for ~20 users) running Ubuntu 22.04 / 24.04
+- [ ] Root / sudo on the VPS
 - [ ] A Google Cloud project with Gmail API + People API enabled
 - [ ] An OAuth 2.0 Client ID (type: **Web application**)
-- [ ] All ICE employees who'll use this added as **Test users** in the OAuth consent screen (up to 100 in testing mode)
+- [ ] All ICE employees added as **Test users** in the OAuth consent screen (testing mode, up to 100 — fine for 20)
 
 ---
 
 ## Step 1 — DNS
 
-Point your domain/subdomain at the VPS public IP via an `A` record.
+Point your subdomain at the VPS public IP:
 
 ```
 gmail-mcp.ice.com.  A  203.0.113.42      (TTL: 300)
 ```
 
-Wait until `dig gmail-mcp.ice.com` returns your VPS IP (usually <5 min on Hostinger).
+Wait until `dig gmail-mcp.ice.com` returns the VPS IP (usually <5 min on Hostinger).
 
 ---
 
@@ -31,30 +33,27 @@ Wait until `dig gmail-mcp.ice.com` returns your VPS IP (usually <5 min on Hostin
 
 In your existing GCP project:
 
-1. **APIs & Services → Library** → ensure Gmail API + People API are enabled.
-2. **APIs & Services → Credentials** → create or edit your OAuth 2.0 Client ID:
-   - Application type: **Web application**
-   - Authorized redirect URIs → add: `https://gmail-mcp.ice.com/oauth/callback`
-   - Save. Copy the **Client ID** and **Client Secret**.
-3. **APIs & Services → OAuth consent screen → Test users** → add every ICE employee email that will use this MCP. (Testing mode caps at 100 — fine for 20–21.)
+1. **APIs & Services → Library** — confirm **Gmail API** and **People API** are enabled.
+2. **APIs & Services → Credentials** — open your OAuth 2.0 Client ID (type **Web application**):
+   - **Authorized redirect URIs** — add BOTH of these (your domain, your callbacks):
+     - `https://gmail-mcp.ice.com/oauth/google-callback` *(used by the user sign-in flow)*
+     - `https://gmail-mcp.ice.com/oauth/callback` *(used when a user adds a second/third Gmail account)*
+   - Save. Copy **Client ID** and **Client Secret**.
+3. **APIs & Services → OAuth consent screen → Test users** — add every ICE employee email that will use this MCP. Testing-mode cap is 100, so you have plenty of headroom for 20-21.
+   - This is your access allowlist. Anyone not on this list is rejected at Google's consent screen — they cannot sign in.
 
 ---
 
 ## Step 3 — Provision the VPS
 
-On the Hostinger VPS:
-
 ```bash
-# Update + install base tools
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y python3.12 python3.12-venv python3-pip git nginx certbot python3-certbot-nginx ufw
 
-# Firewall
 sudo ufw allow OpenSSH
 sudo ufw allow 'Nginx Full'
 sudo ufw enable
 
-# Create a dedicated user
 sudo useradd -m -s /bin/bash gmail-mcp
 sudo mkdir -p /opt/gmail-mcp/data
 sudo chown -R gmail-mcp:gmail-mcp /opt/gmail-mcp
@@ -76,10 +75,9 @@ pip install -e .
 
 ---
 
-## Step 5 — Create the .env
+## Step 5 — Create .env
 
 ```bash
-# Generate a Fernet key
 ENC_KEY=$(/opt/gmail-mcp/venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
 
 cat > /opt/gmail-mcp/.env <<EOF
@@ -89,15 +87,17 @@ GMAIL_MCP_HTTP_PORT=8765
 GMAIL_MCP_PUBLIC_BASE_URL=https://gmail-mcp.ice.com
 GMAIL_MCP_DATA_DIR=/opt/gmail-mcp/data
 GMAIL_MCP_ENCRYPTION_KEY=$ENC_KEY
-GMAIL_MCP_OAUTH_CLIENT_ID=<paste from Google Cloud Console>
-GMAIL_MCP_OAUTH_CLIENT_SECRET=<paste from Google Cloud Console>
+GMAIL_MCP_OAUTH_CLIENT_ID=<paste from GCC>
+GMAIL_MCP_OAUTH_CLIENT_SECRET=<paste from GCC>
 GMAIL_MCP_OAUTH_REDIRECT_URI=https://gmail-mcp.ice.com/oauth/callback
+# Optional second-layer allowlist (GCC test users is the primary gate):
+GMAIL_MCP_ALLOWED_DOMAINS=ice.com
 EOF
 
 chmod 600 /opt/gmail-mcp/.env
 ```
 
-**Critical:** back up `.env` somewhere safe. Losing `GMAIL_MCP_ENCRYPTION_KEY` makes every stored Gmail token unrecoverable.
+**Critical:** back up `.env` somewhere safe. Lose `GMAIL_MCP_ENCRYPTION_KEY` → every stored Gmail token is unrecoverable.
 
 ---
 
@@ -107,13 +107,10 @@ chmod 600 /opt/gmail-mcp/.env
 sudo cp /opt/gmail-mcp/app/deploy/gmail-mcp.service.example /etc/systemd/system/gmail-mcp.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now gmail-mcp
-sudo systemctl status gmail-mcp           # should show "active (running)"
-journalctl -u gmail-mcp -n 50 --no-pager  # check logs
-```
+sudo systemctl status gmail-mcp
+journalctl -u gmail-mcp -n 50 --no-pager
 
-Confirm the server is listening locally:
-
-```bash
+# Local sanity check
 curl http://127.0.0.1:8765/health
 # → {"status":"ok","transport":"http"}
 ```
@@ -124,49 +121,23 @@ curl http://127.0.0.1:8765/health
 
 ```bash
 sudo cp /opt/gmail-mcp/app/deploy/nginx.conf.example /etc/nginx/sites-available/gmail-mcp
-# Edit the file — replace gmail-mcp.example.com with your real domain
-sudo nano /etc/nginx/sites-available/gmail-mcp
-
+sudo nano /etc/nginx/sites-available/gmail-mcp     # replace gmail-mcp.example.com with your real domain
 sudo ln -s /etc/nginx/sites-available/gmail-mcp /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
-
-# Get a Let's Encrypt cert
 sudo certbot --nginx -d gmail-mcp.ice.com
-# Follow prompts. certbot edits the nginx config in place.
 
-# Verify
 curl https://gmail-mcp.ice.com/health
 # → {"status":"ok","transport":"http"}
+
+curl https://gmail-mcp.ice.com/.well-known/oauth-authorization-server | head
+# Should return JSON with issuer/authorization_endpoint/token_endpoint
 ```
 
 ---
 
-## Step 8 — Create users + bearer tokens
+## Step 8 — Distribute the universal config snippet
 
-For every ICE employee who needs access:
-
-```bash
-sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin user-create --email sid@ice.com
-```
-
-Output includes:
-- A bearer token (**shown ONCE — save it**)
-- A ready-to-paste Claude Desktop config snippet
-
-Send the snippet (with the token) to the user via a secure channel — **not plain email**. 1Password, Bitwarden Send, Signal, etc.
-
-To rotate a token: `gmail-mcp-admin user-rotate --email sid@ice.com`
-To revoke access: `gmail-mcp-admin user-revoke --email sid@ice.com`
-
----
-
-## Step 9 — User-side setup (what you send to Sid and others)
-
-Each user needs:
-1. Node.js installed (for `npx mcp-remote`). On macOS: `brew install node`. On Windows: download from nodejs.org.
-2. Their Claude Desktop config updated. **Settings → Developer → Edit Config**, then paste the snippet you sent them under `mcpServers`. Restart Claude Desktop.
-
-Example final config:
+That's it on the server side. To onboard users, send them this — **same snippet for everyone**:
 
 ```json
 {
@@ -176,42 +147,63 @@ Example final config:
       "args": [
         "-y",
         "mcp-remote",
-        "https://gmail-mcp.ice.com/mcp",
-        "--header",
-        "Authorization: Bearer gmcp_<their-token>"
+        "https://gmail-mcp.ice.com/mcp"
       ]
     }
   }
 }
 ```
 
-After restart, in Claude Desktop:
-> "List my Gmail accounts" → returns "No accounts yet."
-> "Authenticate my work email — alias 'work', email 'sid@ice.com'"
-> → Claude calls `gmail_authenticate`, returns a URL. Sid clicks it → Google login → success page.
-> Now: "Search my work inbox for recent invoices" → works.
+(Use `gmail-mcp-admin config-snippet` on the VPS to print this with your actual URL.)
+
+### User-side steps (send this to each ICE employee):
+
+1. Install Node.js if not already installed (for `npx mcp-remote`).
+   - macOS: `brew install node`
+   - Windows: download from nodejs.org
+2. In Claude Desktop: **Settings → Developer → Edit Config**.
+3. Paste the snippet above under `"mcpServers"`. Save. Quit + restart Claude Desktop.
+4. Ask Claude: "List my Gmail accounts" — Claude Desktop will open a browser, prompt **Sign in with Google**, you grant Gmail access, you see a success page, you go back to Claude.
+5. Done. Your primary Gmail is now connected as `account="primary"`.
+
+To add another Gmail account (e.g., personal alongside work):
+> "Authenticate my personal Gmail — alias 'personal', email 'me@gmail.com'"
+
+Claude returns a click-link, you sign in with the *other* Google account, done.
 
 ---
 
-## Step 10 — Verify everything
-
-Run from your laptop:
+## Step 9 — Ops commands
 
 ```bash
-# Should return service info
-curl https://gmail-mcp.ice.com/
+# Who's signed in?
+sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin user-list
 
-# Should be 401 (missing bearer)
-curl -i https://gmail-mcp.ice.com/mcp
+# Block someone (revokes user + all their access tokens):
+sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin user-revoke --email sid@ice.com
 
-# With a real bearer:
-curl -i https://gmail-mcp.ice.com/mcp -H "Authorization: Bearer gmcp_xxxxx"
-# Expected: not 401. (May be a 4xx from MCP — that's fine, just confirming auth passes.)
+# Force someone to re-sign-in (revokes only their access tokens):
+sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin tokens-revoke-user --email sid@ice.com
+
+# List a user's tokens (debugging stale clients):
+sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin user-tokens --email sid@ice.com
+
+# Reprint the universal config snippet:
+sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin config-snippet
+
+# Sweep expired states/codes/tokens (good as a daily cron):
+sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin cleanup
+```
+
+Cron suggestion (root crontab):
+
+```cron
+0 4 * * * /usr/bin/sudo -u gmail-mcp /opt/gmail-mcp/venv/bin/gmail-mcp-admin cleanup >/dev/null 2>&1
 ```
 
 ---
 
-## Updating the server later
+## Updating
 
 ```bash
 sudo -u gmail-mcp -s
@@ -221,24 +213,19 @@ source /opt/gmail-mcp/venv/bin/activate
 pip install -e .
 exit
 sudo systemctl restart gmail-mcp
-journalctl -u gmail-mcp -n 20 --no-pager
 ```
 
-User-side: no action required. Their Claude Desktop config keeps working.
+User side: nothing. Their cached OAuth token keeps working until it expires.
 
 ---
 
 ## Backups
 
-The only state worth backing up is `/opt/gmail-mcp/data/data.db` and `/opt/gmail-mcp/.env`. With both you can fully restore. Without `.env`'s encryption key, the DB is inert.
-
-Cron job example (root):
-
 ```cron
 0 3 * * * tar czf /var/backups/gmail-mcp-$(date +\%Y\%m\%d).tar.gz /opt/gmail-mcp/data /opt/gmail-mcp/.env && find /var/backups -name 'gmail-mcp-*.tar.gz' -mtime +30 -delete
 ```
 
-Ship the tarball off-box to S3 / Hostinger object storage / wherever — don't keep backups only on the same VPS as the DB.
+Ship the tarball off-box (S3, Hostinger object storage, etc.).
 
 ---
 
@@ -246,20 +233,20 @@ Ship the tarball off-box to S3 / Hostinger object storage / wherever — don't k
 
 | Symptom | Likely cause |
 |---|---|
-| `gmail-mcp.service` won't start, exit code 1 | `.env` missing a required var. Run `journalctl -u gmail-mcp -n 50` |
-| User gets "Missing or malformed Authorization header" | They pasted the snippet wrong; bearer token missing in the `--header` flag |
-| OAuth callback shows "OAuth state token is invalid or has expired" | User waited >10 min, or the link was clicked twice. Just re-run `gmail_authenticate` |
-| OAuth callback shows "Google did not return a refresh_token" | User already granted access to this client before. Revoke at https://myaccount.google.com/permissions and retry |
-| User connects to MCP but can't see attachments correctly | Their Claude Desktop is on an old version. Update Claude Desktop |
-| 502 Bad Gateway | gmail-mcp service is down. `sudo systemctl status gmail-mcp` |
-| `mcp-remote` errors in Claude Desktop logs | Bad URL or expired token. Try `gmail-mcp-admin user-rotate` |
+| Claude Desktop says "no MCP server" | mcp-remote not installed. Run `npx -y mcp-remote --version` manually to install it |
+| Browser pops up but Google says "Access blocked: This app's request is invalid" | Redirect URI not registered in GCC. Re-check Step 2 — both `/oauth/google-callback` AND `/oauth/callback` must be added |
+| Google says "gmail-mcp has not completed Google verification" | Normal in Testing mode — user clicks "Advanced → Go to gmail-mcp (unsafe)" |
+| User signs in but sees "Sign-in not allowed for X" | Either GCC Testing mode hasn't added them as Test User, or your `GMAIL_MCP_ALLOWED_DOMAINS`/`_EMAILS` excludes them |
+| OAuth callback shows "Google did not return refresh_token" | User has prior grant. Revoke at https://myaccount.google.com/permissions and retry |
+| 502 Bad Gateway via nginx | `gmail-mcp.service` is down. `sudo systemctl status gmail-mcp` |
+| Server logs "redirect_uri does not match" | Claude Desktop sent a localhost callback that wasn't seen in a prior `/oauth/register`. mcp-remote re-registers automatically; if it persists, restart Claude Desktop |
 
 ---
 
-## Migrating Sid from the old single-user version
+## Security notes
 
-1. Issue Sid a bearer token: `gmail-mcp-admin user-create --email sid@ice.com`
-2. Send him the new config snippet (replaces the old `command: gmail-mcp` entry in his Claude Desktop config).
-3. He restarts Claude Desktop, runs `gmail_authenticate` for each Gmail account he had before. Old `~/.gmail-mcp/` on his laptop becomes unused and can be deleted.
-
-There is no automated migration of his old tokens — the old format used the OAuth client's installed-app flow, the new one uses web-application flow. They're different OAuth credential types in Google. Re-authenticating is the clean path.
+- GCC Test Users is the primary access gate. Production-mode OAuth would let any Google account sign in — DO NOT switch to Production unless you also set `GMAIL_MCP_ALLOWED_DOMAINS` or `GMAIL_MCP_ALLOWED_EMAILS`.
+- All Gmail refresh tokens are Fernet-encrypted at rest with the env key.
+- All access tokens are SHA256-hashed at rest.
+- PKCE (S256) is required on the MCP OAuth flow — no token can be exchanged without the original code_verifier.
+- Per-user data isolation: every storage query is `WHERE user_id = ?`; user_id always comes from the validated bearer token, never from a tool parameter.

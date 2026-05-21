@@ -112,6 +112,40 @@ SCOPES = [
 
 OAUTH_STATE_TTL_SECONDS = 600  # 10 minutes to complete the consent flow
 
+# Lifetime of the access tokens we issue to MCP clients (Claude Desktop, etc.)
+ACCESS_TOKEN_TTL_SECONDS = int(_get("GMAIL_MCP_ACCESS_TOKEN_TTL", "2592000") or "2592000")  # 30 days
+AUTHORIZATION_CODE_TTL_SECONDS = 600  # 10 minutes — RFC 6749 recommendation
+
+
+# ----- Optional allowlist (defence-in-depth on top of GCC test users gate) -----
+
+def get_allowed_domains() -> list[str]:
+    """Comma-separated list of allowed email domains. Empty = no restriction."""
+    raw = _get("GMAIL_MCP_ALLOWED_DOMAINS", "") or ""
+    return [d.strip().lower().lstrip("@") for d in raw.split(",") if d.strip()]
+
+
+def get_allowed_emails() -> list[str]:
+    """Comma-separated list of allowed emails. Empty = no restriction."""
+    raw = _get("GMAIL_MCP_ALLOWED_EMAILS", "") or ""
+    return [e.strip().lower() for e in raw.split(",") if e.strip()]
+
+
+def email_is_allowed(email: str) -> bool:
+    """
+    Returns True if the email passes the allowlist (or no allowlist is set).
+    GCC test users mode is the primary gate; this is a second layer.
+    """
+    email_lc = email.lower().strip()
+    allowed_emails = get_allowed_emails()
+    if allowed_emails and email_lc in allowed_emails:
+        return True
+    allowed_domains = get_allowed_domains()
+    if allowed_domains and any(email_lc.endswith("@" + d) for d in allowed_domains):
+        return True
+    # If neither list is configured, allow everyone (GCC test users is the gate)
+    return not allowed_emails and not allowed_domains
+
 
 # ----- Logging helper -----
 

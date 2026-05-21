@@ -54,8 +54,9 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 email TEXT UNIQUE NOT NULL,
-                bearer_token_hash TEXT UNIQUE NOT NULL,
-                bearer_token_prefix TEXT NOT NULL,
+                google_sub TEXT UNIQUE,
+                bearer_token_hash TEXT UNIQUE,
+                bearer_token_prefix TEXT,
                 is_admin INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 revoked_at TEXT
@@ -76,20 +77,61 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS oauth_states (
                 state TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                email TEXT NOT NULL,
+                user_id TEXT,
+                alias TEXT,
+                email TEXT,
                 description TEXT,
+                kind TEXT NOT NULL DEFAULT 'add_account',
+                client_id TEXT,
+                client_redirect_uri TEXT,
+                client_state TEXT,
+                code_challenge TEXT,
+                code_challenge_method TEXT,
+                scope TEXT,
+                expires_at REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                client_name TEXT,
+                redirect_uris TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_codes (
+                code TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                code_challenge TEXT NOT NULL,
+                code_challenge_method TEXT NOT NULL,
+                scope TEXT,
                 expires_at REAL NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+                token_hash TEXT PRIMARY KEY,
+                token_prefix TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                client_id TEXT,
+                scope TEXT,
+                expires_at REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_user_accounts_user
                 ON user_accounts(user_id);
-
             CREATE INDEX IF NOT EXISTS idx_oauth_states_expires
                 ON oauth_states(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_oauth_codes_expires
+                ON oauth_codes(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_oauth_access_tokens_user
+                ON oauth_access_tokens(user_id);
             """
         )
 
@@ -317,15 +359,16 @@ def create_oauth_state(
 
 def consume_oauth_state(state: str) -> Optional[dict]:
     """
-    Look up and delete an OAuth state token. Returns the original context
-    or None if missing/expired. Single-use.
+    Look up and delete an add_account OAuth state. Returns the original context
+    or None if missing/expired/wrong-kind. Single-use.
     """
     with _db_lock, _conn() as c:
         row = c.execute(
-            "SELECT user_id, alias, email, description, expires_at FROM oauth_states WHERE state = ?",
+            "SELECT user_id, alias, email, description, kind, expires_at "
+            "FROM oauth_states WHERE state = ?",
             (state,),
         ).fetchone()
-        if not row:
+        if not row or row["kind"] != "add_account":
             return None
         c.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
         if time.time() > row["expires_at"]:
@@ -342,3 +385,260 @@ def cleanup_expired_oauth_states() -> int:
     with _db_lock, _conn() as c:
         cur = c.execute("DELETE FROM oauth_states WHERE expires_at < ?", (time.time(),))
         return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# v3 — OAuth authorization server: users by Google identity
+# ---------------------------------------------------------------------------
+
+def find_or_create_user_by_google(google_sub: str, email: str) -> str:
+    """
+    Look up a user by their Google subject ID (stable identifier). If not found,
+    look up by email (handles users created before we tracked sub) and link.
+    If still not found, create a new user. Returns user_id.
+    """
+    with _db_lock, _conn() as c:
+        row = c.execute(
+            "SELECT id, revoked_at FROM users WHERE google_sub = ?",
+            (google_sub,),
+        ).fetchone()
+        if row:
+            if row["revoked_at"]:
+                raise PermissionError(f"User {email} is revoked.")
+            return row["id"]
+
+        # Try by email (legacy / pre-OAuth users)
+        row = c.execute(
+            "SELECT id, revoked_at FROM users WHERE email = ?",
+            (email.lower().strip(),),
+        ).fetchone()
+        if row:
+            if row["revoked_at"]:
+                raise PermissionError(f"User {email} is revoked.")
+            c.execute(
+                "UPDATE users SET google_sub = ? WHERE id = ?",
+                (google_sub, row["id"]),
+            )
+            return row["id"]
+
+        # Create new user — no bearer token (OAuth-only access)
+        user_id = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO users (id, email, google_sub, is_admin, created_at) "
+            "VALUES (?, ?, ?, 0, ?)",
+            (user_id, email.lower().strip(), google_sub, _now_iso()),
+        )
+    log(f"OAuth sign-in created user {email} (id={user_id})")
+    return user_id
+
+
+# ---------------------------------------------------------------------------
+# v3 — OAuth state extension (PKCE + client info)
+# ---------------------------------------------------------------------------
+
+def create_signin_state(
+    *,
+    client_id: str,
+    client_redirect_uri: str,
+    client_state: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: Optional[str],
+) -> str:
+    """
+    State for the OUTER OAuth dance (MCP client ↔ our server).
+    We hand this state to Google; Google returns it to us in the callback.
+    """
+    state = generate_bearer_token().replace("gmcp_", "sgn_")
+    expires_at = time.time() + OAUTH_STATE_TTL_SECONDS
+    with _db_lock, _conn() as c:
+        c.execute(
+            "INSERT INTO oauth_states (state, kind, client_id, client_redirect_uri, "
+            "client_state, code_challenge, code_challenge_method, scope, expires_at, created_at) "
+            "VALUES (?, 'signin', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                state, client_id, client_redirect_uri, client_state,
+                code_challenge, code_challenge_method, scope,
+                expires_at, _now_iso(),
+            ),
+        )
+    return state
+
+
+def consume_signin_state(state: str) -> Optional[dict]:
+    with _db_lock, _conn() as c:
+        row = c.execute(
+            "SELECT kind, client_id, client_redirect_uri, client_state, "
+            "code_challenge, code_challenge_method, scope, expires_at "
+            "FROM oauth_states WHERE state = ?",
+            (state,),
+        ).fetchone()
+        if not row or row["kind"] != "signin":
+            return None
+        c.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+        if time.time() > row["expires_at"]:
+            return None
+        return {
+            "client_id": row["client_id"],
+            "client_redirect_uri": row["client_redirect_uri"],
+            "client_state": row["client_state"],
+            "code_challenge": row["code_challenge"],
+            "code_challenge_method": row["code_challenge_method"],
+            "scope": row["scope"],
+        }
+
+
+# ---------------------------------------------------------------------------
+# v3 — OAuth clients (Dynamic Client Registration)
+# ---------------------------------------------------------------------------
+
+def register_oauth_client(client_name: str, redirect_uris: list[str]) -> str:
+    client_id = "mcp_" + uuid.uuid4().hex
+    with _db_lock, _conn() as c:
+        c.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (client_id, client_name, json.dumps(redirect_uris), _now_iso()),
+        )
+    log(f"Registered OAuth client {client_name} (id={client_id})")
+    return client_id
+
+
+def get_oauth_client(client_id: str) -> Optional[dict]:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT client_id, client_name, redirect_uris FROM oauth_clients WHERE client_id = ?",
+            (client_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "client_id": row["client_id"],
+        "client_name": row["client_name"],
+        "redirect_uris": json.loads(row["redirect_uris"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# v3 — Authorization codes (one-time, PKCE-bound)
+# ---------------------------------------------------------------------------
+
+def create_authorization_code(
+    *,
+    client_id: str,
+    user_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: Optional[str],
+) -> str:
+    from .config import AUTHORIZATION_CODE_TTL_SECONDS
+    code = generate_bearer_token().replace("gmcp_", "cod_")
+    expires_at = time.time() + AUTHORIZATION_CODE_TTL_SECONDS
+    with _db_lock, _conn() as c:
+        c.execute(
+            "INSERT INTO oauth_codes (code, client_id, user_id, redirect_uri, "
+            "code_challenge, code_challenge_method, scope, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (code, client_id, user_id, redirect_uri, code_challenge,
+             code_challenge_method, scope, expires_at, _now_iso()),
+        )
+    return code
+
+
+def consume_authorization_code(code: str) -> Optional[dict]:
+    with _db_lock, _conn() as c:
+        row = c.execute(
+            "SELECT client_id, user_id, redirect_uri, code_challenge, "
+            "code_challenge_method, scope, expires_at FROM oauth_codes WHERE code = ?",
+            (code,),
+        ).fetchone()
+        if not row:
+            return None
+        c.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+        if time.time() > row["expires_at"]:
+            return None
+        return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# v3 — Access tokens (opaque, hashed at rest)
+# ---------------------------------------------------------------------------
+
+def create_access_token(
+    *, user_id: str, client_id: Optional[str], scope: Optional[str]
+) -> str:
+    from .config import ACCESS_TOKEN_TTL_SECONDS
+    token = generate_bearer_token().replace("gmcp_", "at_")
+    token_h = hash_bearer_token(token)
+    prefix = bearer_token_prefix(token)
+    expires_at = time.time() + ACCESS_TOKEN_TTL_SECONDS
+    with _db_lock, _conn() as c:
+        c.execute(
+            "INSERT INTO oauth_access_tokens (token_hash, token_prefix, user_id, "
+            "client_id, scope, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (token_h, prefix, user_id, client_id, scope, expires_at, _now_iso()),
+        )
+    return token
+
+
+def get_user_by_access_token(token: str) -> Optional[dict]:
+    token_h = hash_bearer_token(token)
+    with _conn() as c:
+        row = c.execute(
+            "SELECT t.user_id, t.expires_at, t.revoked_at, u.email, u.revoked_at AS user_revoked_at "
+            "FROM oauth_access_tokens t JOIN users u ON t.user_id = u.id "
+            "WHERE t.token_hash = ?",
+            (token_h,),
+        ).fetchone()
+    if not row:
+        return None
+    if row["revoked_at"] or row["user_revoked_at"]:
+        return None
+    if time.time() > row["expires_at"]:
+        return None
+    return {"id": row["user_id"], "email": row["email"]}
+
+
+def revoke_access_token(token: str) -> bool:
+    token_h = hash_bearer_token(token)
+    with _db_lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE oauth_access_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+            (_now_iso(), token_h),
+        )
+        return cur.rowcount > 0
+
+
+def revoke_all_user_tokens(user_id: str) -> int:
+    with _db_lock, _conn() as c:
+        cur = c.execute(
+            "UPDATE oauth_access_tokens SET revoked_at = ? "
+            "WHERE user_id = ? AND revoked_at IS NULL",
+            (_now_iso(), user_id),
+        )
+        return cur.rowcount
+
+
+def list_user_access_tokens(user_id: str) -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT token_prefix, client_id, scope, created_at, expires_at, revoked_at "
+            "FROM oauth_access_tokens WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cleanup_expired_oauth_artifacts() -> dict:
+    """Sweep expired states, codes, and tokens. Run periodically (e.g., daily cron)."""
+    now = time.time()
+    with _db_lock, _conn() as c:
+        states = c.execute("DELETE FROM oauth_states WHERE expires_at < ?", (now,)).rowcount
+        codes = c.execute("DELETE FROM oauth_codes WHERE expires_at < ?", (now,)).rowcount
+        tokens = c.execute(
+            "DELETE FROM oauth_access_tokens WHERE expires_at < ? AND revoked_at IS NOT NULL",
+            (now,),
+        ).rowcount
+    return {"states": states, "codes": codes, "tokens": tokens}

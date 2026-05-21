@@ -1,24 +1,58 @@
-# Gmail MCP Server (v2 — multi-tenant)
+# Gmail MCP Server (v3 — OAuth, zero per-user setup)
 
-A Gmail MCP server you can host once and share with your whole team. Each user authenticates with their own bearer token; their Gmail accounts and OAuth tokens are completely isolated from every other user's. No local Python install needed for end users — they just paste a config snippet into Claude Desktop.
+A self-hosted Gmail MCP server where **everyone in your organization pastes the same config snippet** into Claude Desktop. On first use, Claude Desktop opens a browser, the user signs in with Google, and that's it — no per-user tokens to issue, no admin involvement.
 
-Two modes:
-
-| Mode | Transport | When |
-|---|---|---|
-| **stdio** | local | Solo developer running it on their own laptop. No bearer auth. |
-| **http**  | remote streamable-HTTP | Hosted on a VPS. Each user has a bearer token. Multi-tenant. |
+Per-user data isolation is enforced by the OAuth flow itself: each user's Google identity creates an isolated user record on the server. Their connected Gmail accounts are never visible to anyone else.
 
 ---
 
-## What changed from v1
+## How it works
 
-- **Multi-tenant**: every user is identified by an `Authorization: Bearer` token on every request. They only see their own connected Gmail accounts.
-- **SQLite storage** at `$GMAIL_MCP_DATA_DIR/data.db`. Refresh tokens are encrypted with Fernet (key in env).
-- **Remote OAuth flow**: `gmail_authenticate` now returns a URL to click. Google redirects to `/oauth/callback` on the server. No more spawning local HTTP servers on the user's laptop.
-- **New tool**: `gmail_download_attachment` for fetching PDF/DOCX/image bytes by attachment ID.
-- **Admin CLI**: `gmail-mcp-admin` for creating/revoking/rotating user tokens.
-- **Deploy story**: Dockerfile, docker-compose, systemd unit, nginx config, full [DEPLOYMENT.md](DEPLOYMENT.md).
+```
+Claude Desktop  ─[Authorization Code + PKCE]→  Gmail MCP  ─[Auth Code]→  Google
+                                                    │
+                                                    │  identity + Gmail scopes
+                                                    ▼
+                                              find_or_create user
+                                              auto-connect 'primary' Gmail
+                                                    │
+                                                    ▼
+Claude Desktop  ←[opaque access token]──── Gmail MCP
+                       (cached locally, 30-day default TTL)
+```
+
+First-time user experience:
+
+1. Paste config snippet → restart Claude Desktop
+2. Ask Claude: "Search my Gmail for invoices"
+3. Browser pops up automatically → **Sign in with Google** → grant Gmail access
+4. Success page → go back to Claude
+5. Gmail tools work
+
+Adding more Gmail accounts later:
+> "Authenticate my personal Gmail — alias 'personal'"
+Claude returns a link. Click it, sign in with the other Google account, done.
+
+---
+
+## The universal config snippet
+
+```json
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://gmail-mcp.your-domain.com/mcp"
+      ]
+    }
+  }
+}
+```
+
+Same snippet for every user. No token. No env vars.
 
 ---
 
@@ -26,91 +60,85 @@ Two modes:
 
 | Tool | Purpose |
 |---|---|
-| `gmail_list_accounts` | List the calling user's connected Gmail accounts |
-| `gmail_authenticate` | Start OAuth flow for a new Gmail account (returns clickable URL) |
+| `gmail_list_accounts` | List your connected Gmail accounts |
+| `gmail_authenticate` | Connect an additional Gmail account (returns click-link) |
 | `gmail_search_emails` | Gmail query syntax search |
 | `gmail_read_email` | Body + headers + attachment metadata (with attachment IDs) |
-| `gmail_download_attachment` | Download attachment bytes to disk |
+| `gmail_download_attachment` | Download attachment bytes (PDF, DOCX, etc.) to disk |
 | `gmail_draft_email` | Create draft (never sends) |
 | `gmail_modify_email` | Trash, archive, label, star, mark read/unread |
-| `gmail_list_labels` | List all labels with counts |
+| `gmail_list_labels` | List labels with counts |
 | `gmail_search_contacts` | Google People API search |
 
-All tools take an `account` parameter — the alias of one of *your* connected Gmail accounts. Two users can both have `account="work"` pointing at completely different inboxes.
+All tools take an `account` parameter — the alias of one of *your* connected Gmails. Default after sign-in is `account="primary"`.
 
 ---
 
-## Quick start — hosted deployment
+## Access control
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the full 10-step runbook (Hostinger VPS + nginx + Let's Encrypt + Google Cloud Console).
+| Layer | Mechanism |
+|---|---|
+| Who can sign in (primary) | **Google Cloud Console → Test users**. Anyone not on this list is rejected by Google's consent screen. |
+| Who can sign in (optional second layer) | Env vars `GMAIL_MCP_ALLOWED_DOMAINS` / `GMAIL_MCP_ALLOWED_EMAILS`. Useful if you ever move out of GCC Testing mode. |
+| Per-user data isolation | Every storage query is `WHERE user_id = ?`. `user_id` is set from the OAuth access token in middleware, never from a tool parameter. |
+| Revocation | `gmail-mcp-admin user-revoke --email sid@ice.com` blocks user + invalidates all their tokens. |
+
+---
+
+## Server modes
+
+| Mode | Transport | When |
+|---|---|---|
+| **stdio** | local | Solo developer, no remote install. Single implicit local-dev user. |
+| **http**  | streamable-HTTP | Hosted on a VPS. Full OAuth flow. Multi-tenant. |
+
+---
+
+## Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full 9-step runbook (Hostinger VPS + nginx + Let's Encrypt + Google Cloud Console).
 
 TL;DR:
-1. DNS — point a subdomain at your VPS.
-2. Google Cloud Console — add `https://your-domain/oauth/callback` as an authorized redirect URI; add team emails as Test users.
-3. VPS — install, copy `.env.example` → `.env`, fill in values, start with systemd or docker-compose.
-4. `gmail-mcp-admin user-create --email <user>@<domain>` for each team member.
-5. Send each user the printed Claude Desktop config snippet.
+1. DNS → VPS
+2. Google Cloud Console — add two redirect URIs + add team emails as Test users
+3. VPS — pip install, fill `.env`, start with systemd
+4. Send the universal snippet to your team
+
+No `gmail-mcp-admin user-create` step. That's the point of v3.
 
 ---
 
-## Quick start — local stdio mode
-
-For solo development on your own machine:
+## Ops commands
 
 ```bash
-git clone https://github.com/Abhinandan7619/GmailMcp.git
-cd GmailMcp
-python -m venv venv
-source venv/bin/activate              # Windows: venv\Scripts\activate
-pip install -e .
-
-# Generate an encryption key
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-
-# Create .env
-cat > .env <<EOF
-GMAIL_MCP_TRANSPORT=stdio
-GMAIL_MCP_ENCRYPTION_KEY=<paste the key above>
-GMAIL_MCP_OAUTH_CLIENT_ID=<from Google Cloud Console>
-GMAIL_MCP_OAUTH_CLIENT_SECRET=<from Google Cloud Console>
-GMAIL_MCP_OAUTH_REDIRECT_URI=http://localhost:8765/oauth/callback
-EOF
+gmail-mcp-admin user-list                          # who's signed in
+gmail-mcp-admin user-revoke --email <e>            # block a user
+gmail-mcp-admin tokens-revoke-user --email <e>     # force re-sign-in (keeps user)
+gmail-mcp-admin user-tokens --email <e>            # debug stale clients
+gmail-mcp-admin config-snippet                     # print the universal snippet
+gmail-mcp-admin cleanup                            # sweep expired artifacts (daily cron)
 ```
-
-Add to Claude Desktop config:
-```json
-{
-  "mcpServers": {
-    "gmail": {
-      "command": "/full/path/to/venv/bin/gmail-mcp"
-    }
-  }
-}
-```
-
-In stdio mode an implicit `local-dev` user is used — no bearer token needed.
 
 ---
 
 ## Architecture
 
 ```
-Claude Desktop
-    │
-    │ stdio: spawns gmail-mcp directly
-    │ http:  npx mcp-remote → HTTPS → nginx → uvicorn
-    │
-    ▼
-gmail-mcp (FastMCP)
-    │ ├── BearerAuthMiddleware (http only) — validates token, sets user context
-    │ ├── /oauth/callback                   — Google → back to us
-    │ └── /mcp                              — MCP streamable-HTTP endpoint
-    │
-    ▼
-SQLite (data.db)
-    users        (bearer_token_hash SHA256, revoked_at, is_admin)
-    user_accounts (user_id, alias, email, token_encrypted Fernet)
-    oauth_states  (state token, user_id, alias, 10-min TTL)
+src/gmail_mcp/
+  config.py          env loading, allowlist helpers
+  storage.py         SQLite: users, user_accounts, oauth_clients,
+                     oauth_codes, oauth_access_tokens, oauth_states
+  crypto.py          Fernet + bearer token hashing
+  context.py         contextvar for the current user_id
+  auth.py            Google API service builders, refresh logic,
+                     add-account OAuth flow
+  oauth_server.py    OAuth 2.1 endpoints (authorize, token, register,
+                     google-callback, metadata, revoke)
+  middleware.py      Validate OAuth access tokens; 401 with WWW-Authenticate
+  gmail_client.py    Gmail API wrapper (all per (user_id, alias))
+  contacts_client.py People API wrapper
+  server.py          FastMCP tools + transport selection + HTTP routes
+  admin_cli.py       gmail-mcp-admin
 ```
 
 ---
@@ -119,24 +147,23 @@ SQLite (data.db)
 
 | Surface | Mitigation |
 |---|---|
-| Bearer tokens at rest | Stored as SHA256 hash. Plaintext shown once at issuance. |
-| Refresh tokens at rest | Fernet-encrypted (AES-128-CBC + HMAC) with key from env. |
-| Path traversal in attachment downloads | `os.path.basename(filename)` strips path components. |
-| Cross-user data access | Every tool reads `user_id` from contextvar — never from a tool parameter. Storage queries are always `WHERE user_id = ?`. |
-| OAuth CSRF | Short-lived (10 min) single-use state tokens stored server-side. |
-| Transport | nginx terminates TLS via Let's Encrypt. Bearer tokens never sent over plaintext. |
+| Access tokens at rest | SHA256-hashed; we never store plaintext |
+| Gmail refresh tokens at rest | Fernet (AES-128-CBC + HMAC) encrypted with env key |
+| Authorization code reuse | Single-use, 10-minute TTL, deleted on consumption |
+| Authorization code theft | PKCE (S256) required — possession of code alone is useless |
+| Cross-user data access | `user_id` from validated token only; storage layer always scopes by user_id |
+| Random sign-ups | GCC Test Users gate + optional env allowlist |
+| MITM | nginx terminates TLS via Let's Encrypt |
 
-What this does **not** protect against:
-- Compromise of the VPS itself (an attacker with root can read the encryption key from `.env` and decrypt all tokens). Use disk encryption + restricted SSH access.
-- Malicious admin (anyone with `gmail-mcp-admin` access can issue tokens or revoke users).
+Not protected against:
+- VPS root compromise (attacker reads `.env`, decrypts tokens). Use disk encryption + restrict SSH.
+- Malicious admin with CLI access can revoke + impersonate.
 
 ---
 
 ## Updating
 
-Server: `git pull && pip install -e . && sudo systemctl restart gmail-mcp`
-
-User-side: no action.
+`git pull && pip install -e . && systemctl restart gmail-mcp`. Users do nothing.
 
 ---
 

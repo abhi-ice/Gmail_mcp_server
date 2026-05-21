@@ -46,8 +46,10 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 def build_consent_url(state: str) -> str:
     """
-    Build the Google OAuth consent URL. The user clicks this; Google calls
-    our /oauth/callback with the code on success.
+    Build the Google OAuth consent URL for the ADD-ACCOUNT flow (an already
+    signed-in user attaching another Gmail account). Google redirects to
+    /oauth/callback with the state token. (Sign-in uses /oauth/google-callback
+    in oauth_server.py — different endpoint, different state kind.)
     """
     params = {
         "client_id": get_oauth_client_id(),
@@ -55,7 +57,7 @@ def build_consent_url(state: str) -> str:
         "response_type": "code",
         "scope": " ".join(SCOPES),
         "access_type": "offline",
-        "prompt": "consent",  # force refresh_token to be issued every time
+        "prompt": "consent",
         "state": state,
         "include_granted_scopes": "true",
     }

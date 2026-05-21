@@ -21,7 +21,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
-from . import auth, context, gmail_client, contacts_client, storage
+from . import auth, context, gmail_client, contacts_client, oauth_server, storage
 from .config import (
     HTTP_HOST,
     HTTP_PORT,
@@ -29,7 +29,7 @@ from .config import (
     get_public_base_url,
     log,
 )
-from .middleware import BearerAuthMiddleware
+from .middleware import OAuthAccessTokenMiddleware
 from .models import (
     AuthenticateInput,
     DownloadAttachmentInput,
@@ -657,11 +657,26 @@ def _run_http() -> None:
     routes = [
         Route("/", endpoint=root, methods=["GET"]),
         Route("/health", endpoint=health, methods=["GET"]),
+
+        # OAuth 2.1 Authorization Server endpoints
+        Route("/.well-known/oauth-authorization-server",
+              endpoint=oauth_server.authorization_server_metadata, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource",
+              endpoint=oauth_server.protected_resource_metadata, methods=["GET"]),
+        Route("/oauth/register",       endpoint=oauth_server.register,        methods=["POST"]),
+        Route("/oauth/authorize",      endpoint=oauth_server.authorize,       methods=["GET"]),
+        Route("/oauth/google-callback", endpoint=oauth_server.google_callback, methods=["GET"]),
+        Route("/oauth/token",          endpoint=oauth_server.token,           methods=["POST"]),
+        Route("/oauth/revoke",         endpoint=oauth_server.revoke,          methods=["POST"]),
+
+        # Legacy: per-account add flow (used by gmail_authenticate tool for additional accounts)
         Route("/oauth/callback", endpoint=oauth_callback, methods=["GET"]),
+
+        # MCP streamable-HTTP endpoint last (catches everything else)
         Mount("/", app=mcp_app),
     ]
     app = Starlette(routes=routes)
-    app.add_middleware(BearerAuthMiddleware)
+    app.add_middleware(OAuthAccessTokenMiddleware)
 
     uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, log_level="info")
 
