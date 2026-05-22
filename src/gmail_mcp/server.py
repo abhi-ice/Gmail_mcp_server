@@ -39,11 +39,12 @@ from .models import (
     DraftEmailInput,
     ListLabelsInput,
     ModifyEmailInput,
+    ReadAttachmentInput,
     ReadEmailInput,
     SearchContactsInput,
     SearchEmailsInput,
 )
-from .utils import format_size, handle_api_error, validate_account_alias
+from .utils import extract_attachment_text, format_size, handle_api_error, validate_account_alias
 
 
 def _build_transport_security() -> TransportSecuritySettings:
@@ -590,6 +591,99 @@ async def gmail_download_attachment(
         return str(e)
     except Exception as e:
         log(f"gmail_download_attachment error: {e}")
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 10: gmail_read_attachment
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="gmail_read_attachment",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def gmail_read_attachment(
+    account: str,
+    message_id: str,
+    attachment_id: str,
+    max_size_mb: int = 10,
+) -> str:
+    """
+    Read the FULL CONTENT of an email attachment inline.
+
+    Returns extracted text for PDF / DOCX / XLSX / plain text / JSON / CSV files,
+    or base64-encoded bytes for binary formats this server can't parse natively.
+
+    Use this when you need to actually SEE what's in an attachment (e.g. read a
+    PDF, summarize a Word doc, look at a spreadsheet). Use `gmail_download_attachment`
+    instead when you only need to save the file to local disk.
+
+    Args:
+        account: Account alias.
+        message_id: Email message ID.
+        attachment_id: Attachment ID from gmail_read_email output.
+        max_size_mb: Skip attachments larger than this (default 10, max 25).
+    """
+    try:
+        validated = ReadAttachmentInput(
+            account=account,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            max_size_mb=max_size_mb,
+        )
+        user_id = _get_user_id()
+        err = validate_account_alias(validated.account, _user_accounts_dict(user_id))
+        if err:
+            return err
+
+        info = gmail_client.read_attachment(
+            user_id=user_id,
+            alias=validated.account,
+            message_id=validated.message_id,
+            attachment_id=validated.attachment_id,
+            max_size_mb=validated.max_size_mb,
+        )
+
+        binary = info["binary"]
+        mime = info["mime_type"]
+        filename = info["filename"]
+
+        text_content, fmt_label = extract_attachment_text(binary, mime, filename)
+
+        lines = [
+            f"## Attachment: {filename}",
+            "",
+            f"**MIME type:** `{mime}`",
+            f"**Size:**      {format_size(info['size_bytes'])}",
+        ]
+
+        if text_content is not None:
+            lines.append(f"**Extraction:** {fmt_label}")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            lines.append(text_content)
+        else:
+            import base64 as _b64
+            b64 = _b64.b64encode(binary).decode("ascii")
+            lines.append("**Extraction:** none — returning raw bytes as base64")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            lines.append(f"```base64 mime={mime}")
+            lines.append(b64)
+            lines.append("```")
+            lines.append("")
+            lines.append("_Decode the block above to recover the original bytes._")
+
+        return "\n".join(lines)
+
+    except ValueError as e:
+        return f"Invalid input: {e}"
+    except RuntimeError as e:
+        return str(e)
+    except Exception as e:
+        log(f"gmail_read_attachment error: {e}")
         return handle_api_error(e)
 
 

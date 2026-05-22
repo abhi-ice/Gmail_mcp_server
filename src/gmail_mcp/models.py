@@ -190,3 +190,26 @@ class DownloadAttachmentInput(BaseModel):
         None,
         description="Directory to save the attachment into. Defaults to the server's current working directory if not provided.",
     )
+
+
+class ReadAttachmentInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+    message_id: str = Field(
+        ...,
+        min_length=1,
+        description="Email message ID (from gmail_search_emails or gmail_read_email).",
+    )
+    attachment_id: str = Field(
+        ...,
+        min_length=1,
+        description="Attachment ID (from gmail_read_email output).",
+    )
+    max_size_mb: int = Field(
+        default=10,
+        ge=1,
+        le=25,
+        description="Skip attachments larger than this many MB (default 10, max 25). Prevents huge responses.",
+    )

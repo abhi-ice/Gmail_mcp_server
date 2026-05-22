@@ -3,7 +3,7 @@
 import base64
 import sys
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Optional
 
 
 def format_size(num_bytes: int) -> str:
@@ -158,6 +158,93 @@ def extract_attachment_info(payload: dict) -> list[dict]:
 
     _recurse(payload)
     return attachments
+
+
+def extract_attachment_text(binary: bytes, mime_type: str, filename: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Try to extract human-readable text from attachment bytes based on MIME type.
+    Returns (text, format_label) — text is None if we don't know how to handle this type.
+    format_label is a short human description of the extraction method used.
+    """
+    from io import BytesIO
+
+    mime = (mime_type or "").lower()
+    name_lower = (filename or "").lower()
+
+    # ----- Plain text family -----
+    if mime.startswith("text/") or mime in (
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/x-yaml",
+        "application/yaml",
+    ):
+        try:
+            return binary.decode("utf-8", errors="replace"), "decoded as UTF-8"
+        except Exception:
+            return None, None
+
+    # ----- PDF -----
+    if mime == "application/pdf" or name_lower.endswith(".pdf"):
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(BytesIO(binary))
+            parts: list[str] = []
+            for i, page in enumerate(reader.pages):
+                page_text = (page.extract_text() or "").strip()
+                parts.append(f"--- Page {i + 1} ---\n{page_text or '(empty/scanned page)'}")
+            return "\n\n".join(parts), f"extracted via pypdf ({len(reader.pages)} pages)"
+        except Exception as e:
+            print(f"[gmail-mcp] PDF extraction failed: {e}", file=sys.stderr)
+            return None, None
+
+    # ----- DOCX -----
+    if (
+        mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or name_lower.endswith(".docx")
+    ):
+        try:
+            import docx  # python-docx
+            doc = docx.Document(BytesIO(binary))
+            paragraphs = [p.text for p in doc.paragraphs]
+            # Also include table contents
+            for table in doc.tables:
+                for row in table.rows:
+                    paragraphs.append("\t".join(cell.text for cell in row.cells))
+            return "\n".join(paragraphs), "extracted via python-docx"
+        except Exception as e:
+            print(f"[gmail-mcp] DOCX extraction failed: {e}", file=sys.stderr)
+            return None, None
+
+    # ----- XLSX -----
+    if (
+        mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        or name_lower.endswith(".xlsx")
+        or name_lower.endswith(".xlsm")
+    ):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(BytesIO(binary), read_only=True, data_only=True)
+            parts: list[str] = []
+            for sheet in wb.worksheets:
+                parts.append(f"--- Sheet: {sheet.title} ---")
+                for row in sheet.iter_rows(values_only=True):
+                    cells = ["" if v is None else str(v) for v in row]
+                    parts.append("\t".join(cells))
+            return "\n".join(parts), f"extracted via openpyxl ({len(wb.worksheets)} sheet(s))"
+        except Exception as e:
+            print(f"[gmail-mcp] XLSX extraction failed: {e}", file=sys.stderr)
+            return None, None
+
+    # ----- CSV / TSV (fallback for text/* match above usually handles, but in case mime is octet-stream) -----
+    if name_lower.endswith(".csv") or name_lower.endswith(".tsv"):
+        try:
+            return binary.decode("utf-8", errors="replace"), "decoded as UTF-8 (CSV/TSV)"
+        except Exception:
+            return None, None
+
+    # Unknown / binary
+    return None, None
 
 
 def format_email_headers(headers: list[dict]) -> dict[str, str]:

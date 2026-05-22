@@ -110,6 +110,76 @@ def read_email(user_id: str, alias: str, message_id: str) -> dict:
     }
 
 
+def read_attachment(
+    user_id: str,
+    alias: str,
+    message_id: str,
+    attachment_id: str,
+    max_size_mb: int = 10,
+) -> dict:
+    """
+    Fetch attachment bytes and discover filename/mime from the message.
+    Returns dict: {filename, mime_type, size_bytes, binary}.
+    Raises ValueError if the attachment exceeds max_size_mb.
+    """
+    service = get_gmail_service(user_id, alias)
+
+    # First fetch the message to find filename + mime + reported size for this attachment
+    msg = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute()
+    )
+
+    found = {"filename": "attachment", "mimeType": "application/octet-stream", "size": 0}
+
+    def _walk(part: dict) -> bool:
+        body = part.get("body", {})
+        if body.get("attachmentId") == attachment_id:
+            found["filename"] = part.get("filename") or "attachment"
+            found["mimeType"] = part.get("mimeType") or "application/octet-stream"
+            found["size"] = int(body.get("size") or 0)
+            return True
+        for sub in part.get("parts", []):
+            if _walk(sub):
+                return True
+        return False
+
+    _walk(msg.get("payload", {}))
+
+    max_bytes = max_size_mb * 1024 * 1024
+    if found["size"] > max_bytes:
+        raise ValueError(
+            f"Attachment is {found['size']} bytes ({found['size']/1024/1024:.1f} MB), "
+            f"exceeds max_size_mb={max_size_mb}. Use gmail_download_attachment for larger files."
+        )
+
+    # Fetch the bytes
+    result = (
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
+    data = result.get("data", "")
+    if not data:
+        raise RuntimeError(
+            "Attachment returned no data. The attachment_id may be invalid."
+        )
+
+    padded = data + "=" * (-len(data) % 4)
+    binary = base64.urlsafe_b64decode(padded)
+
+    return {
+        "filename": found["filename"],
+        "mime_type": found["mimeType"],
+        "size_bytes": len(binary),
+        "binary": binary,
+    }
+
+
 def download_attachment(
     user_id: str,
     alias: str,
