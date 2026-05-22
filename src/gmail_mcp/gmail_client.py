@@ -119,12 +119,24 @@ def read_attachment(
 ) -> dict:
     """
     Fetch attachment bytes and discover filename/mime from the message.
+
+    NOTE: Gmail regenerates attachment_id values on every messages.get()
+    call — they're ephemeral. The same attachment downloaded twice will have
+    two different attachment_ids. The attachments().get() endpoint tolerates
+    old IDs (the download still works), but we can't match by attachmentId
+    in a fresh message-tree walk.
+
+    Strategy: collect every attachment-shaped part from the tree (filename,
+    mime, body.size) in document order. Download the bytes via the passed
+    attachment_id (Gmail accepts it). Then match the downloaded size to the
+    tree's reported body.size to find the right filename.
+
     Returns dict: {filename, mime_type, size_bytes, binary}.
-    Raises ValueError if the attachment exceeds max_size_mb.
     """
     service = get_gmail_service(user_id, alias)
 
-    # Fetch message metadata to find filename + mime for this attachment
+    # Walk the tree to enumerate attachments (with FRESH attachment_ids that
+    # we mostly ignore, but we keep filename/mime/size per part).
     msg = (
         service.users()
         .messages()
@@ -132,46 +144,28 @@ def read_attachment(
         .execute()
     )
 
-    found = {"filename": "", "mimeType": "", "size": 0}
-    all_attachments_seen: list[dict] = []  # for diagnostic logging
+    tree_attachments: list[dict] = []
 
-    def _walk(part: dict) -> bool:
+    def _walk(part: dict) -> None:
         body = part.get("body", {})
-        bid = body.get("attachmentId")
-        if bid:
-            all_attachments_seen.append({
-                "id_prefix": bid[:24],
-                "filename": part.get("filename", ""),
-                "mimeType": part.get("mimeType", ""),
+        filename = part.get("filename") or ""
+        if filename:  # parts with filenames are attachments (vs inline body)
+            tree_attachments.append({
+                "filename": filename,
+                "mimeType": part.get("mimeType") or "",
+                "size": int(body.get("size") or 0),
+                "fresh_attachment_id": body.get("attachmentId") or "",
             })
-        if bid and bid == attachment_id:
-            found["filename"] = part.get("filename") or ""
-            found["mimeType"] = part.get("mimeType") or ""
-            found["size"] = int(body.get("size") or 0)
-            return True
         for sub in part.get("parts", []):
-            if _walk(sub):
-                return True
-        return False
+            _walk(sub)
 
-    matched = _walk(msg.get("payload", {}))
+    _walk(msg.get("payload", {}))
 
-    if not matched:
-        print(
-            f"[gmail-mcp] read_attachment: target id {attachment_id[:24]}... "
-            f"NOT FOUND in message tree. Saw {len(all_attachments_seen)} attachment(s): "
-            f"{all_attachments_seen}",
-            file=sys.stderr,
-        )
+    # If the reported size of any attachment is over the cap, we still allow
+    # the download attempt (the actual binary might compress differently).
+    # We'll re-check the cap after download.
 
-    max_bytes = max_size_mb * 1024 * 1024
-    if found["size"] > max_bytes:
-        raise ValueError(
-            f"Attachment is {found['size']} bytes ({found['size']/1024/1024:.1f} MB), "
-            f"exceeds max_size_mb={max_size_mb}. Use gmail_download_attachment for larger files."
-        )
-
-    # Fetch the bytes
+    # Download the bytes via the caller's attachment_id (works even if stale)
     result = (
         service.users()
         .messages()
@@ -188,15 +182,49 @@ def read_attachment(
     padded = data + "=" * (-len(data) % 4)
     binary = base64.urlsafe_b64decode(padded)
 
-    # Fallback: if walker didn't find the part, infer filename/mime from magic bytes
-    if not found["filename"]:
-        found["filename"] = _guess_filename(binary)
-    if not found["mimeType"]:
-        found["mimeType"] = _guess_mime(binary)
+    max_bytes = max_size_mb * 1024 * 1024
+    if len(binary) > max_bytes:
+        raise ValueError(
+            f"Attachment is {len(binary)} bytes ({len(binary)/1024/1024:.1f} MB), "
+            f"exceeds max_size_mb={max_size_mb}. Use gmail_download_attachment for larger files."
+        )
+
+    # Match by size to recover filename + mime from the tree
+    matches_by_size = [a for a in tree_attachments if a["size"] == len(binary)]
+    filename = ""
+    mime = ""
+    if len(matches_by_size) == 1:
+        # Unambiguous size match — trust it
+        filename = matches_by_size[0]["filename"]
+        mime = matches_by_size[0]["mimeType"]
+    elif len(matches_by_size) > 1:
+        # Multiple attachments with the same size — take the first; user can
+        # tell them apart by content. (Rare in practice.)
+        filename = matches_by_size[0]["filename"]
+        mime = matches_by_size[0]["mimeType"]
+        print(
+            f"[gmail-mcp] read_attachment: {len(matches_by_size)} attachments "
+            f"share size {len(binary)} bytes; using first match '{filename}'.",
+            file=sys.stderr,
+        )
+    else:
+        # No size match. Could be a body part inlined as attachment, or
+        # Gmail's reported size differs slightly from the decoded byte length.
+        # Fall back to magic-byte detection.
+        print(
+            f"[gmail-mcp] read_attachment: no size match for {len(binary)} bytes. "
+            f"Tree had: {[(a['filename'], a['size']) for a in tree_attachments]}",
+            file=sys.stderr,
+        )
+
+    if not filename:
+        filename = _guess_filename(binary)
+    if not mime:
+        mime = _guess_mime(binary)
 
     return {
-        "filename": found["filename"],
-        "mime_type": found["mimeType"],
+        "filename": filename,
+        "mime_type": mime,
         "size_bytes": len(binary),
         "binary": binary,
     }
