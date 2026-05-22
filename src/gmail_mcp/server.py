@@ -646,6 +646,7 @@ def _run_stdio() -> None:
 
 
 def _run_http() -> None:
+    import contextlib
     import uvicorn
 
     storage.init_db()
@@ -653,6 +654,15 @@ def _run_http() -> None:
     log(f"Public base URL: {get_public_base_url()}")
 
     mcp_app = mcp.streamable_http_app()
+
+    # CRITICAL: when mounting FastMCP's app inside a parent Starlette app, the
+    # parent owns the lifespan, so we must propagate the child's lifespan to
+    # start MCP's session_manager task group. Without this, POST /mcp returns
+    # 500 "Task group is not initialized. Make sure to use run()."
+    @contextlib.asynccontextmanager
+    async def lifespan(parent_app):
+        async with mcp.session_manager.run():
+            yield
 
     routes = [
         Route("/", endpoint=root, methods=["GET"]),
@@ -675,7 +685,7 @@ def _run_http() -> None:
         # MCP streamable-HTTP endpoint last (catches everything else)
         Mount("/", app=mcp_app),
     ]
-    app = Starlette(routes=routes)
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(OAuthAccessTokenMiddleware)
 
     uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT, log_level="info")
