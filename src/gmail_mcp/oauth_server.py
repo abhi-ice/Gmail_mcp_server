@@ -264,7 +264,10 @@ async def google_callback(request: Request):
     if ctx["client_state"]:
         params["state"] = ctx["client_state"]
     redirect_url = f"{ctx['client_redirect_uri']}?{urlencode(params)}"
-    log(f"Sign-in complete for {email}; redirecting MCP client back")
+    log(
+        f"google_callback: minted code={our_code[:12]}... for user={user_id} "
+        f"client={ctx['client_id']} redirect={ctx['client_redirect_uri']}"
+    )
     return RedirectResponse(url=redirect_url, status_code=302)
 
 
@@ -276,6 +279,7 @@ async def token(request: Request):
     form = await request.form()
     grant_type = form.get("grant_type", "")
     if grant_type != "authorization_code":
+        log(f"token: rejecting grant_type={grant_type}")
         return JSONResponse(
             {"error": "unsupported_grant_type", "error_description": "Only authorization_code is supported."},
             status_code=400,
@@ -286,25 +290,43 @@ async def token(request: Request):
     code_verifier = form.get("code_verifier", "")
     redirect_uri = form.get("redirect_uri", "")
 
+    log(
+        f"token: incoming code={code[:12] if code else '<missing>'}... "
+        f"client_id={client_id} redirect_uri={redirect_uri} "
+        f"verifier_len={len(code_verifier)}"
+    )
+
     if not code or not client_id or not code_verifier or not redirect_uri:
+        missing = [
+            n for n, v in
+            [("code", code), ("client_id", client_id),
+             ("code_verifier", code_verifier), ("redirect_uri", redirect_uri)]
+            if not v
+        ]
+        log(f"token: missing fields: {missing}")
         return JSONResponse(
-            {"error": "invalid_request", "error_description": "code, client_id, redirect_uri, and code_verifier are required."},
+            {"error": "invalid_request", "error_description": f"Missing required fields: {', '.join(missing)}"},
             status_code=400,
         )
 
     record = storage.consume_authorization_code(code)
     if not record:
+        log(f"token: consume_authorization_code returned None for code={code[:12]}...")
         return JSONResponse({"error": "invalid_grant", "error_description": "Authorization code is invalid or expired."}, status_code=400)
     if record["client_id"] != client_id:
+        log(f"token: client_id mismatch: stored={record['client_id']} request={client_id}")
         return JSONResponse({"error": "invalid_grant", "error_description": "client_id mismatch."}, status_code=400)
     if record["redirect_uri"] != redirect_uri:
+        log(f"token: redirect_uri mismatch: stored={record['redirect_uri']} request={redirect_uri}")
         return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch."}, status_code=400)
 
     # Verify PKCE: base64url(SHA256(code_verifier)) == code_challenge
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     if computed != record["code_challenge"]:
+        log(f"token: PKCE failed: computed={computed[:20]}... stored={record['code_challenge'][:20]}...")
         return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=400)
+    log(f"token: SUCCESS — minting access token for user={record['user_id']}")
 
     access_token = storage.create_access_token(
         user_id=record["user_id"], client_id=client_id, scope=record["scope"],

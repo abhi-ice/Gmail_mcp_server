@@ -554,10 +554,17 @@ def consume_authorization_code(code: str) -> Optional[dict]:
             (code,),
         ).fetchone()
         if not row:
+            # Diagnostic: how many codes exist at all? Helps distinguish
+            # "code was never written" from "code expired and was swept".
+            total = c.execute("SELECT COUNT(*) FROM oauth_codes").fetchone()[0]
+            log(f"consume_authorization_code: code {code[:12]}... NOT FOUND (db has {total} code(s) total)")
             return None
         c.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+        age = time.time() - (row["expires_at"] - 600)  # subtract TTL to get age since creation
         if time.time() > row["expires_at"]:
+            log(f"consume_authorization_code: code {code[:12]}... EXPIRED (age={age:.1f}s, TTL was 600s)")
             return None
+        log(f"consume_authorization_code: code {code[:12]}... consumed (age={age:.1f}s)")
         return dict(row)
 
 
