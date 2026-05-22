@@ -15,7 +15,10 @@ from __future__ import annotations
 import sys
 from typing import Optional
 
+from urllib.parse import urlparse
+
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -42,7 +45,25 @@ from .models import (
 )
 from .utils import format_size, handle_api_error, validate_account_alias
 
-mcp = FastMCP("gmail_mcp")
+
+def _build_transport_security() -> TransportSecuritySettings:
+    """
+    FastMCP's DNS-rebinding protection rejects Host headers not on this list.
+    Default only allows localhost; we add our public hostname so production
+    requests aren't blocked with 421 Misdirected Request.
+    """
+    allowed = ["127.0.0.1", "localhost", f"127.0.0.1:{HTTP_PORT}", f"localhost:{HTTP_PORT}"]
+    if TRANSPORT == "http":
+        try:
+            host = urlparse(get_public_base_url()).hostname
+            if host:
+                allowed.append(host)
+        except Exception:
+            pass
+    return TransportSecuritySettings(allowed_hosts=allowed)
+
+
+mcp = FastMCP("gmail_mcp", transport_security=_build_transport_security())
 
 
 def _get_user_id() -> str:
