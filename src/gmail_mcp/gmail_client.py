@@ -124,7 +124,7 @@ def read_attachment(
     """
     service = get_gmail_service(user_id, alias)
 
-    # First fetch the message to find filename + mime + reported size for this attachment
+    # Fetch message metadata to find filename + mime for this attachment
     msg = (
         service.users()
         .messages()
@@ -132,13 +132,21 @@ def read_attachment(
         .execute()
     )
 
-    found = {"filename": "attachment", "mimeType": "application/octet-stream", "size": 0}
+    found = {"filename": "", "mimeType": "", "size": 0}
+    all_attachments_seen: list[dict] = []  # for diagnostic logging
 
     def _walk(part: dict) -> bool:
         body = part.get("body", {})
-        if body.get("attachmentId") == attachment_id:
-            found["filename"] = part.get("filename") or "attachment"
-            found["mimeType"] = part.get("mimeType") or "application/octet-stream"
+        bid = body.get("attachmentId")
+        if bid:
+            all_attachments_seen.append({
+                "id_prefix": bid[:24],
+                "filename": part.get("filename", ""),
+                "mimeType": part.get("mimeType", ""),
+            })
+        if bid and bid == attachment_id:
+            found["filename"] = part.get("filename") or ""
+            found["mimeType"] = part.get("mimeType") or ""
             found["size"] = int(body.get("size") or 0)
             return True
         for sub in part.get("parts", []):
@@ -146,7 +154,15 @@ def read_attachment(
                 return True
         return False
 
-    _walk(msg.get("payload", {}))
+    matched = _walk(msg.get("payload", {}))
+
+    if not matched:
+        print(
+            f"[gmail-mcp] read_attachment: target id {attachment_id[:24]}... "
+            f"NOT FOUND in message tree. Saw {len(all_attachments_seen)} attachment(s): "
+            f"{all_attachments_seen}",
+            file=sys.stderr,
+        )
 
     max_bytes = max_size_mb * 1024 * 1024
     if found["size"] > max_bytes:
@@ -172,12 +188,72 @@ def read_attachment(
     padded = data + "=" * (-len(data) % 4)
     binary = base64.urlsafe_b64decode(padded)
 
+    # Fallback: if walker didn't find the part, infer filename/mime from magic bytes
+    if not found["filename"]:
+        found["filename"] = _guess_filename(binary)
+    if not found["mimeType"]:
+        found["mimeType"] = _guess_mime(binary)
+
     return {
         "filename": found["filename"],
         "mime_type": found["mimeType"],
         "size_bytes": len(binary),
         "binary": binary,
     }
+
+
+def _guess_filename(binary: bytes) -> str:
+    """Best-effort filename when message walker didn't find the part."""
+    if binary[:5] == b"%PDF-":
+        return "attachment.pdf"
+    if binary[:4] == b"PK\x03\x04":
+        # ZIP-based — could be DOCX, XLSX, PPTX, or plain ZIP
+        # Try to peek at the ZIP central directory for hints
+        try:
+            import zipfile
+            from io import BytesIO
+            with zipfile.ZipFile(BytesIO(binary)) as zf:
+                names = zf.namelist()
+                if "word/document.xml" in names:
+                    return "attachment.docx"
+                if "xl/workbook.xml" in names:
+                    return "attachment.xlsx"
+                if "ppt/presentation.xml" in names:
+                    return "attachment.pptx"
+        except Exception:
+            pass
+        return "attachment.zip"
+    if binary[:3] == b"\xff\xd8\xff":
+        return "attachment.jpg"
+    if binary[:8] == b"\x89PNG\r\n\x1a\n":
+        return "attachment.png"
+    return "attachment.bin"
+
+
+def _guess_mime(binary: bytes) -> str:
+    """Best-effort MIME from magic bytes."""
+    if binary[:5] == b"%PDF-":
+        return "application/pdf"
+    if binary[:4] == b"PK\x03\x04":
+        try:
+            import zipfile
+            from io import BytesIO
+            with zipfile.ZipFile(BytesIO(binary)) as zf:
+                names = zf.namelist()
+                if "word/document.xml" in names:
+                    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                if "xl/workbook.xml" in names:
+                    return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                if "ppt/presentation.xml" in names:
+                    return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        except Exception:
+            pass
+        return "application/zip"
+    if binary[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if binary[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return "application/octet-stream"
 
 
 def download_attachment(

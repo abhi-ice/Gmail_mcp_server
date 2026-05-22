@@ -160,90 +160,126 @@ def extract_attachment_info(payload: dict) -> list[dict]:
     return attachments
 
 
+def _try_pdf(binary: bytes) -> tuple[Optional[str], Optional[str]]:
+    from io import BytesIO
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(BytesIO(binary))
+        parts: list[str] = []
+        for i, page in enumerate(reader.pages):
+            page_text = (page.extract_text() or "").strip()
+            parts.append(f"--- Page {i + 1} ---\n{page_text or '(empty/scanned page)'}")
+        return "\n\n".join(parts), f"PDF extracted via pypdf ({len(reader.pages)} page(s))"
+    except Exception as e:
+        print(f"[gmail-mcp] PDF parse failed: {e}", file=sys.stderr)
+        return None, None
+
+
+def _try_docx(binary: bytes) -> tuple[Optional[str], Optional[str]]:
+    from io import BytesIO
+    try:
+        import docx  # python-docx
+        doc = docx.Document(BytesIO(binary))
+        paragraphs = [p.text for p in doc.paragraphs]
+        for table in doc.tables:
+            for row in table.rows:
+                paragraphs.append("\t".join(cell.text for cell in row.cells))
+        text = "\n".join(paragraphs).strip()
+        if not text:
+            return None, None
+        return text, "DOCX extracted via python-docx"
+    except Exception as e:
+        print(f"[gmail-mcp] DOCX parse failed: {e}", file=sys.stderr)
+        return None, None
+
+
+def _try_xlsx(binary: bytes) -> tuple[Optional[str], Optional[str]]:
+    from io import BytesIO
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(BytesIO(binary), read_only=True, data_only=True)
+        parts: list[str] = []
+        for sheet in wb.worksheets:
+            parts.append(f"--- Sheet: {sheet.title} ---")
+            for row in sheet.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v) for v in row]
+                parts.append("\t".join(cells))
+        text = "\n".join(parts).strip()
+        if not text:
+            return None, None
+        return text, f"XLSX extracted via openpyxl ({len(wb.worksheets)} sheet(s))"
+    except Exception as e:
+        print(f"[gmail-mcp] XLSX parse failed: {e}", file=sys.stderr)
+        return None, None
+
+
+def _try_utf8(binary: bytes) -> tuple[Optional[str], Optional[str]]:
+    try:
+        text = binary.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, None
+    # Heuristic: only treat as text if mostly printable
+    if not text:
+        return None, None
+    printable = sum(1 for c in text if c.isprintable() or c in "\n\r\t")
+    if printable / len(text) < 0.85:
+        return None, None
+    return text, "decoded as UTF-8"
+
+
 def extract_attachment_text(binary: bytes, mime_type: str, filename: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Try to extract human-readable text from attachment bytes based on MIME type.
-    Returns (text, format_label) — text is None if we don't know how to handle this type.
-    format_label is a short human description of the extraction method used.
-    """
-    from io import BytesIO
+    Try to extract human-readable text from attachment bytes.
+    Returns (text, format_label) — both None if we can't extract.
 
+    Strategy: prefer hints (filename + MIME), but ALWAYS verify by actually
+    parsing the bytes. This is robust even when Gmail returns
+    application/octet-stream or no filename.
+    """
     mime = (mime_type or "").lower()
     name_lower = (filename or "").lower()
 
-    # ----- Plain text family -----
-    if mime.startswith("text/") or mime in (
-        "application/json",
-        "application/xml",
-        "application/javascript",
-        "application/x-yaml",
-        "application/yaml",
+    # Magic-byte sniffing — most reliable
+    is_pdf = binary[:5] == b"%PDF-"
+    is_zip = binary[:4] == b"PK\x03\x04"
+
+    # ----- PDF -----
+    if is_pdf or mime == "application/pdf" or name_lower.endswith(".pdf"):
+        result = _try_pdf(binary)
+        if result[0] is not None:
+            return result
+
+    # ----- ZIP-based Office formats: try DOCX, then XLSX -----
+    if is_zip or any(name_lower.endswith(ext) for ext in (".docx", ".xlsx", ".xlsm")):
+        # Try DOCX first (most common)
+        if "wordprocessingml" in mime or name_lower.endswith(".docx") or is_zip:
+            result = _try_docx(binary)
+            if result[0] is not None:
+                return result
+        # Then XLSX
+        if "spreadsheetml" in mime or name_lower.endswith((".xlsx", ".xlsm")) or is_zip:
+            result = _try_xlsx(binary)
+            if result[0] is not None:
+                return result
+
+    # ----- Plain text family (decode by MIME or extension) -----
+    if (
+        mime.startswith("text/")
+        or mime in ("application/json", "application/xml", "application/javascript",
+                    "application/x-yaml", "application/yaml")
+        or name_lower.endswith((".txt", ".md", ".csv", ".tsv", ".json", ".xml",
+                                 ".yaml", ".yml", ".html", ".htm", ".log"))
     ):
         try:
             return binary.decode("utf-8", errors="replace"), "decoded as UTF-8"
         except Exception:
-            return None, None
+            pass
 
-    # ----- PDF -----
-    if mime == "application/pdf" or name_lower.endswith(".pdf"):
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(BytesIO(binary))
-            parts: list[str] = []
-            for i, page in enumerate(reader.pages):
-                page_text = (page.extract_text() or "").strip()
-                parts.append(f"--- Page {i + 1} ---\n{page_text or '(empty/scanned page)'}")
-            return "\n\n".join(parts), f"extracted via pypdf ({len(reader.pages)} pages)"
-        except Exception as e:
-            print(f"[gmail-mcp] PDF extraction failed: {e}", file=sys.stderr)
-            return None, None
+    # ----- Last resort: UTF-8 sniff (catches text/* with weird/missing MIME) -----
+    result = _try_utf8(binary)
+    if result[0] is not None:
+        return result
 
-    # ----- DOCX -----
-    if (
-        mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        or name_lower.endswith(".docx")
-    ):
-        try:
-            import docx  # python-docx
-            doc = docx.Document(BytesIO(binary))
-            paragraphs = [p.text for p in doc.paragraphs]
-            # Also include table contents
-            for table in doc.tables:
-                for row in table.rows:
-                    paragraphs.append("\t".join(cell.text for cell in row.cells))
-            return "\n".join(paragraphs), "extracted via python-docx"
-        except Exception as e:
-            print(f"[gmail-mcp] DOCX extraction failed: {e}", file=sys.stderr)
-            return None, None
-
-    # ----- XLSX -----
-    if (
-        mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        or name_lower.endswith(".xlsx")
-        or name_lower.endswith(".xlsm")
-    ):
-        try:
-            import openpyxl
-            wb = openpyxl.load_workbook(BytesIO(binary), read_only=True, data_only=True)
-            parts: list[str] = []
-            for sheet in wb.worksheets:
-                parts.append(f"--- Sheet: {sheet.title} ---")
-                for row in sheet.iter_rows(values_only=True):
-                    cells = ["" if v is None else str(v) for v in row]
-                    parts.append("\t".join(cells))
-            return "\n".join(parts), f"extracted via openpyxl ({len(wb.worksheets)} sheet(s))"
-        except Exception as e:
-            print(f"[gmail-mcp] XLSX extraction failed: {e}", file=sys.stderr)
-            return None, None
-
-    # ----- CSV / TSV (fallback for text/* match above usually handles, but in case mime is octet-stream) -----
-    if name_lower.endswith(".csv") or name_lower.endswith(".tsv"):
-        try:
-            return binary.decode("utf-8", errors="replace"), "decoded as UTF-8 (CSV/TSV)"
-        except Exception:
-            return None, None
-
-    # Unknown / binary
     return None, None
 
 
