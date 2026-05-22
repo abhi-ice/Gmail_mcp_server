@@ -88,7 +88,8 @@ TRANSPORT = (_get("GMAIL_MCP_TRANSPORT", "stdio") or "stdio").lower()
 # "http"  — remote multi-tenant mode (bearer auth required on every request)
 
 HTTP_HOST = _get("GMAIL_MCP_HTTP_HOST", "0.0.0.0") or "0.0.0.0"
-HTTP_PORT = int(_get("GMAIL_MCP_HTTP_PORT", "8765") or "8765")
+# Fall back to PORT (PaaS convention: Railway, Heroku, Render, Fly all set this)
+HTTP_PORT = int(_get("GMAIL_MCP_HTTP_PORT") or _get("PORT") or "8765")
 
 # Public base URL the server tells users to visit for OAuth (e.g., https://gmail-mcp.example.com)
 def get_public_base_url() -> str:
