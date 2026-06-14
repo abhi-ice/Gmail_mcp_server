@@ -12,23 +12,36 @@ scoped to the calling user.
 
 from __future__ import annotations
 
+import os
+import secrets
 import sys
+from pathlib import Path
 from typing import Optional
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from starlette.routing import Mount, Route
 
 from . import auth, context, gmail_client, contacts_client, oauth_server, storage
 from .config import (
+    DOWNLOADS_DIR,
     HTTP_HOST,
     HTTP_PORT,
+    READ_INLINE_MAX_CHARS,
     TRANSPORT,
+    ensure_downloads_dir,
+    get_local_download_dir,
     get_public_base_url,
     log,
 )
@@ -538,6 +551,57 @@ async def gmail_search_contacts(account: str, query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Attachment delivery helpers
+# ---------------------------------------------------------------------------
+
+def _safe_filename(name: str) -> str:
+    safe = os.path.basename((name or "").strip())
+    if not safe or safe in (".", ".."):
+        return "attachment.bin"
+    return safe
+
+
+def _dedupe_path(path: Path) -> Path:
+    """If path exists, append (1), (2), ... before the extension."""
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    i = 1
+    while True:
+        candidate = path.with_name(f"{stem} ({i}){suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def _save_to_local_downloads(binary: bytes, filename: str) -> str:
+    """stdio mode only: write the file into the user's local Downloads folder."""
+    d = get_local_download_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    target = _dedupe_path(d / _safe_filename(filename))
+    target.write_bytes(binary)
+    return str(target)
+
+
+def _persist_for_download(user_id: str, binary: bytes, filename: str, mime: str) -> dict:
+    """
+    http mode: stash the bytes on the server under a random dir, register a
+    short-lived token, and return a signed /files/<token>/<name> URL.
+    """
+    ensure_downloads_dir()
+    safe = _safe_filename(filename)
+    subdir = DOWNLOADS_DIR / secrets.token_hex(16)
+    subdir.mkdir(parents=True, exist_ok=True)
+    fpath = subdir / safe
+    fpath.write_bytes(binary)
+    token = storage.create_download_token(
+        user_id=user_id, path=str(fpath), filename=safe, mime=mime, size_bytes=len(binary)
+    )
+    url = f"{get_public_base_url()}/files/{token}/{quote(safe)}"
+    return {"url": url, "filename": safe}
+
+
+# ---------------------------------------------------------------------------
 # Tool 9: gmail_download_attachment
 # ---------------------------------------------------------------------------
 
@@ -549,40 +613,71 @@ async def gmail_download_attachment(
     account: str,
     message_id: str,
     attachment_id: str,
-    filename: str,
-    save_dir: str = "",
+    filename: str = "",
 ) -> str:
     """
-    Download an email attachment (PDF, DOCX, image, etc.) to local disk.
+    Download an email attachment of ANY type and size — PDF, DOCX, XLSX, images,
+    ZIPs, anything. No size restriction beyond the server's safety ceiling.
+
+    Returns a direct, time-limited download link (valid ~1 hour). Open the link
+    in a browser to save the file, or fetch it programmatically. The real
+    filename is auto-detected; pass `filename` only to override it.
+
+    (When the server runs locally in stdio mode, the file is written straight
+    into your Downloads folder instead and the local path is returned.)
+
+    Args:
+        account: Account alias.
+        message_id: Email message ID.
+        attachment_id: Attachment ID from gmail_read_email output.
+        filename: Optional override for the saved filename.
     """
     try:
         validated = DownloadAttachmentInput(
             account=account,
             message_id=message_id,
             attachment_id=attachment_id,
-            filename=filename,
-            save_dir=save_dir if save_dir else None,
+            filename=filename or None,
         )
         user_id = _get_user_id()
         err = validate_account_alias(validated.account, _user_accounts_dict(user_id))
         if err:
             return err
 
-        result = gmail_client.download_attachment(
+        info = gmail_client.resolve_attachment(
             user_id=user_id,
             alias=validated.account,
             message_id=validated.message_id,
             attachment_id=validated.attachment_id,
-            filename=validated.filename,
-            save_dir=validated.save_dir,
         )
+        binary = info["binary"]
+        mime = info["mime_type"]
+        fname = validated.filename or info["filename"]
 
+        if TRANSPORT == "stdio":
+            path = _save_to_local_downloads(binary, fname)
+            lines = [
+                "## Attachment Downloaded",
+                "",
+                f"**Saved to:** `{path}`",
+                f"**Filename:** {_safe_filename(fname)}",
+                f"**Type:**     {mime}",
+                f"**Size:**     {format_size(info['size_bytes'])}",
+            ]
+            return "\n".join(lines)
+
+        result = _persist_for_download(user_id, binary, fname, mime)
         lines = [
-            "## Attachment Downloaded",
+            "## Attachment Ready",
             "",
-            f"**Saved to:** `{result['path']}`",
-            f"**Filename:** {result['filename']}",
-            f"**Size:**     {format_size(result['size_bytes'])}",
+            f"**Filename:**     {result['filename']}",
+            f"**Type:**         {mime}",
+            f"**Size:**         {format_size(info['size_bytes'])}",
+            "",
+            f"**Download link:** {result['url']}",
+            "",
+            "_Open the link in a browser to save the file (valid ~1 hour). "
+            "If you're an automated client, fetch that URL directly to retrieve the bytes._",
         ]
         return "\n".join(lines)
     except ValueError as e:
@@ -606,42 +701,38 @@ async def gmail_read_attachment(
     account: str,
     message_id: str,
     attachment_id: str,
-    max_size_mb: int = 10,
 ) -> str:
     """
     Read the FULL CONTENT of an email attachment inline.
 
-    Returns extracted text for PDF / DOCX / XLSX / plain text / JSON / CSV files,
-    or base64-encoded bytes for binary formats this server can't parse natively.
-
-    Use this when you need to actually SEE what's in an attachment (e.g. read a
-    PDF, summarize a Word doc, look at a spreadsheet). Use `gmail_download_attachment`
-    instead when you only need to save the file to local disk.
+    - PDF / DOCX / XLSX / TXT / CSV / JSON / XML / HTML  → returns the extracted
+      TEXT so you can read or summarize it directly. No file-size limit (text of
+      very large docs is truncated for display; the full file stays available
+      via gmail_download_attachment).
+    - Images, ZIPs, and other binary formats → can't be turned into text, so
+      this returns a direct download link instead (see gmail_download_attachment).
 
     Args:
         account: Account alias.
         message_id: Email message ID.
         attachment_id: Attachment ID from gmail_read_email output.
-        max_size_mb: Skip attachments larger than this (default 10, max 25).
     """
     try:
         validated = ReadAttachmentInput(
             account=account,
             message_id=message_id,
             attachment_id=attachment_id,
-            max_size_mb=max_size_mb,
         )
         user_id = _get_user_id()
         err = validate_account_alias(validated.account, _user_accounts_dict(user_id))
         if err:
             return err
 
-        info = gmail_client.read_attachment(
+        info = gmail_client.resolve_attachment(
             user_id=user_id,
             alias=validated.account,
             message_id=validated.message_id,
             attachment_id=validated.attachment_id,
-            max_size_mb=validated.max_size_mb,
         )
 
         binary = info["binary"]
@@ -658,24 +749,34 @@ async def gmail_read_attachment(
         ]
 
         if text_content is not None:
+            truncated = False
+            if READ_INLINE_MAX_CHARS and len(text_content) > READ_INLINE_MAX_CHARS:
+                text_content = text_content[:READ_INLINE_MAX_CHARS]
+                truncated = True
             lines.append(f"**Extraction:** {fmt_label}")
             lines.append("")
             lines.append("---")
             lines.append("")
             lines.append(text_content)
-        else:
-            import base64 as _b64
-            b64 = _b64.b64encode(binary).decode("ascii")
-            lines.append("**Extraction:** none — returning raw bytes as base64")
-            lines.append("")
-            lines.append("---")
-            lines.append("")
-            lines.append(f"```base64 mime={mime}")
-            lines.append(b64)
-            lines.append("```")
-            lines.append("")
-            lines.append("_Decode the block above to recover the original bytes._")
+            if truncated:
+                lines.append("")
+                lines.append(
+                    f"_… text truncated at {READ_INLINE_MAX_CHARS:,} characters. "
+                    f"Use gmail_download_attachment to get the complete file._"
+                )
+            return "\n".join(lines)
 
+        # Non-text (image / binary): give a download link rather than useless base64.
+        lines.append("**Extraction:** not a text format — provided as a download instead.")
+        lines.append("")
+        if TRANSPORT == "stdio":
+            path = _save_to_local_downloads(binary, filename)
+            lines.append(f"**Saved to:** `{path}`")
+        else:
+            result = _persist_for_download(user_id, binary, filename, mime)
+            lines.append(f"**Download link:** {result['url']}")
+            lines.append("")
+            lines.append("_Open the link in a browser to save it (valid ~1 hour)._")
         return "\n".join(lines)
 
     except ValueError as e:
@@ -713,6 +814,27 @@ async def oauth_callback(request: Request):
         f"You can close this tab and go back to Claude Desktop."
     )
     return HTMLResponse(_html_status(True, msg))
+
+
+async def serve_file(request: Request):
+    """
+    Serve a previously-downloaded attachment by its signed token.
+    Capability URL: the token is the secret, so this route is exempt from
+    bearer auth (a browser click has no Authorization header). Tokens are
+    unguessable and expire (~1 hour).
+    """
+    token = request.path_params.get("token", "")
+    rec = storage.get_download_token(token)
+    if not rec:
+        return PlainTextResponse("Not found, or this download link has expired.", status_code=404)
+    path = rec["path"]
+    if not os.path.isfile(path):
+        return PlainTextResponse("File is no longer available on the server.", status_code=404)
+    return FileResponse(
+        path,
+        filename=rec["filename"],
+        media_type=rec["mime"] or "application/octet-stream",
+    )
 
 
 async def health(_request: Request):
@@ -796,6 +918,10 @@ def _run_http() -> None:
 
         # Legacy: per-account add flow (used by gmail_authenticate tool for additional accounts)
         Route("/oauth/callback", endpoint=oauth_callback, methods=["GET"]),
+
+        # Signed, time-limited attachment downloads
+        Route("/files/{token}", endpoint=serve_file, methods=["GET"]),
+        Route("/files/{token}/{fname:path}", endpoint=serve_file, methods=["GET"]),
 
         # MCP streamable-HTTP endpoint last (catches everything else)
         Mount("/", app=mcp_app),

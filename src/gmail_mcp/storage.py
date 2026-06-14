@@ -124,6 +124,18 @@ def init_db() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS download_tokens (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                mime TEXT,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                expires_at REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_user_accounts_user
                 ON user_accounts(user_id);
             CREATE INDEX IF NOT EXISTS idx_oauth_states_expires
@@ -132,6 +144,8 @@ def init_db() -> None:
                 ON oauth_codes(expires_at);
             CREATE INDEX IF NOT EXISTS idx_oauth_access_tokens_user
                 ON oauth_access_tokens(user_id);
+            CREATE INDEX IF NOT EXISTS idx_download_tokens_expires
+                ON download_tokens(expires_at);
             """
         )
 
@@ -648,4 +662,63 @@ def cleanup_expired_oauth_artifacts() -> dict:
             "DELETE FROM oauth_access_tokens WHERE expires_at < ? AND revoked_at IS NOT NULL",
             (now,),
         ).rowcount
-    return {"states": states, "codes": codes, "tokens": tokens}
+    downloads = cleanup_expired_downloads()
+    return {"states": states, "codes": codes, "tokens": tokens, "downloads": downloads}
+
+
+# ---------------------------------------------------------------------------
+# Download tokens — signed, short-lived URLs for attachment files (http mode)
+# ---------------------------------------------------------------------------
+
+def create_download_token(
+    *, user_id: str, path: str, filename: str, mime: str, size_bytes: int
+) -> str:
+    """Register a temp file for serving via /files/<token>. Returns the token."""
+    from .config import DOWNLOAD_TOKEN_TTL_SECONDS
+    token = generate_bearer_token().replace("gmcp_", "dl_")
+    expires_at = time.time() + DOWNLOAD_TOKEN_TTL_SECONDS
+    with _db_lock, _conn() as c:
+        c.execute(
+            "INSERT INTO download_tokens (token, user_id, path, filename, mime, size_bytes, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (token, user_id, path, filename, mime or "", int(size_bytes), expires_at, _now_iso()),
+        )
+    return token
+
+
+def get_download_token(token: str) -> Optional[dict]:
+    """Return file metadata for a download token, or None if missing/expired."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT token, user_id, path, filename, mime, size_bytes, expires_at "
+            "FROM download_tokens WHERE token = ?",
+            (token,),
+        ).fetchone()
+    if not row:
+        return None
+    if time.time() > row["expires_at"]:
+        return None
+    return dict(row)
+
+
+def cleanup_expired_downloads() -> int:
+    """Delete expired download-token rows AND their files on disk. Returns count."""
+    import os as _os
+    import shutil as _shutil
+    now = time.time()
+    with _db_lock, _conn() as c:
+        rows = c.execute(
+            "SELECT token, path FROM download_tokens WHERE expires_at < ?",
+            (now,),
+        ).fetchall()
+        for r in rows:
+            try:
+                p = r["path"]
+                if p and _os.path.isfile(p):
+                    # Remove the per-token directory (path is DOWNLOADS_DIR/<token>/<file>)
+                    parent = _os.path.dirname(p)
+                    _shutil.rmtree(parent, ignore_errors=True)
+            except Exception as e:
+                log(f"cleanup_expired_downloads: could not remove {r['path']}: {e}")
+        c.execute("DELETE FROM download_tokens WHERE expires_at < ?", (now,))
+    return len(rows)

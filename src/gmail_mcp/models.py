@@ -180,15 +180,11 @@ class DownloadAttachmentInput(BaseModel):
         min_length=1,
         description="Attachment ID (from gmail_read_email output).",
     )
-    filename: str = Field(
-        ...,
-        min_length=1,
-        max_length=255,
-        description="Filename to save the attachment as. Path components are stripped for safety.",
-    )
-    save_dir: Optional[str] = Field(
+    filename: Optional[str] = Field(
         None,
-        description="Directory to save the attachment into. Defaults to the server's current working directory if not provided.",
+        max_length=255,
+        description="Optional filename to use. If omitted, the attachment's real "
+                    "filename is auto-detected. Path components are stripped for safety.",
     )
 
 
@@ -206,10 +202,4 @@ class ReadAttachmentInput(BaseModel):
         ...,
         min_length=1,
         description="Attachment ID (from gmail_read_email output).",
-    )
-    max_size_mb: int = Field(
-        default=10,
-        ge=1,
-        le=25,
-        description="Skip attachments larger than this many MB (default 10, max 25). Prevents huge responses.",
     )

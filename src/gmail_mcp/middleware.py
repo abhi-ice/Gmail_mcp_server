@@ -25,6 +25,7 @@ EXEMPT_PREFIXES = (
     "/oauth/",
     "/.well-known/",
     "/health",
+    "/files/",  # signed capability URLs — the token in the path is the secret
 )
 EXEMPT_EXACT = {"/"}
 

@@ -41,6 +41,9 @@ def _get_required(key: str) -> str:
 DATA_DIR = Path(_get("GMAIL_MCP_DATA_DIR", str(Path.home() / ".gmail-mcp"))).expanduser().resolve()
 DB_PATH = DATA_DIR / "data.db"
 
+# Temp store for attachments served via signed /files/<token> URLs (http mode).
+DOWNLOADS_DIR = DATA_DIR / "downloads"
+
 
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,33 @@ def ensure_data_dir() -> None:
     except (OSError, NotImplementedError):
         # Windows / non-POSIX — chmod is best-effort
         pass
+
+
+def ensure_downloads_dir() -> None:
+    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Local folder used in stdio mode (server runs on the user's own machine) when
+# no explicit save_dir is given. Remote (http) mode never writes here.
+def get_local_download_dir() -> Path:
+    override = _get("GMAIL_MCP_LOCAL_DOWNLOAD_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path.home() / "Downloads").resolve()
+
+
+# How long a signed /files/<token> URL stays valid (seconds).
+DOWNLOAD_TOKEN_TTL_SECONDS = int(_get("GMAIL_MCP_DOWNLOAD_TTL", "3600") or "3600")  # 1 hour
+
+# Safety ceiling on bytes we'll pull into RAM for a single attachment. Gmail
+# itself caps attachments well below this, so it's effectively "no restriction"
+# for real mail while still protecting the container from an OOM.
+MAX_ATTACHMENT_MB = int(_get("GMAIL_MCP_MAX_ATTACHMENT_MB", "75") or "75")
+
+# Cap on how many characters of EXTRACTED TEXT gmail_read_attachment returns
+# inline. Protects the model context on huge docs; the full file is always
+# available via gmail_download_attachment. 0 = unlimited.
+READ_INLINE_MAX_CHARS = int(_get("GMAIL_MCP_READ_INLINE_MAX_CHARS", "400000") or "400000")
 
 
 # ----- Encryption -----

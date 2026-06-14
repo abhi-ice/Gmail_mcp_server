@@ -110,15 +110,14 @@ def read_email(user_id: str, alias: str, message_id: str) -> dict:
     }
 
 
-def read_attachment(
+def resolve_attachment(
     user_id: str,
     alias: str,
     message_id: str,
     attachment_id: str,
-    max_size_mb: int = 10,
 ) -> dict:
     """
-    Fetch attachment bytes and discover filename/mime from the message.
+    Fetch attachment bytes and discover its real filename + MIME from the message.
 
     NOTE: Gmail regenerates attachment_id values on every messages.get()
     call — they're ephemeral. The same attachment downloaded twice will have
@@ -131,8 +130,14 @@ def read_attachment(
     attachment_id (Gmail accepts it). Then match the downloaded size to the
     tree's reported body.size to find the right filename.
 
+    No per-call size cap — only a generous safety ceiling (MAX_ATTACHMENT_MB)
+    so a malformed/huge payload can't OOM the container. Gmail's own
+    attachment limits sit well under that ceiling.
+
     Returns dict: {filename, mime_type, size_bytes, binary}.
     """
+    from .config import MAX_ATTACHMENT_MB
+
     service = get_gmail_service(user_id, alias)
 
     # Walk the tree to enumerate attachments (with FRESH attachment_ids that
@@ -161,10 +166,6 @@ def read_attachment(
 
     _walk(msg.get("payload", {}))
 
-    # If the reported size of any attachment is over the cap, we still allow
-    # the download attempt (the actual binary might compress differently).
-    # We'll re-check the cap after download.
-
     # Download the bytes via the caller's attachment_id (works even if stale)
     result = (
         service.users()
@@ -182,11 +183,12 @@ def read_attachment(
     padded = data + "=" * (-len(data) % 4)
     binary = base64.urlsafe_b64decode(padded)
 
-    max_bytes = max_size_mb * 1024 * 1024
-    if len(binary) > max_bytes:
+    ceiling = MAX_ATTACHMENT_MB * 1024 * 1024
+    if len(binary) > ceiling:
         raise ValueError(
-            f"Attachment is {len(binary)} bytes ({len(binary)/1024/1024:.1f} MB), "
-            f"exceeds max_size_mb={max_size_mb}. Use gmail_download_attachment for larger files."
+            f"Attachment is {len(binary)/1024/1024:.1f} MB, above the server safety "
+            f"ceiling of {MAX_ATTACHMENT_MB} MB (GMAIL_MCP_MAX_ATTACHMENT_MB). "
+            f"This is larger than Gmail normally allows; if it's legitimate, raise the env var."
         )
 
     # Match by size to recover filename + mime from the tree
@@ -203,7 +205,7 @@ def read_attachment(
         filename = matches_by_size[0]["filename"]
         mime = matches_by_size[0]["mimeType"]
         print(
-            f"[gmail-mcp] read_attachment: {len(matches_by_size)} attachments "
+            f"[gmail-mcp] resolve_attachment: {len(matches_by_size)} attachments "
             f"share size {len(binary)} bytes; using first match '{filename}'.",
             file=sys.stderr,
         )
@@ -212,7 +214,7 @@ def read_attachment(
         # Gmail's reported size differs slightly from the decoded byte length.
         # Fall back to magic-byte detection.
         print(
-            f"[gmail-mcp] read_attachment: no size match for {len(binary)} bytes. "
+            f"[gmail-mcp] resolve_attachment: no size match for {len(binary)} bytes. "
             f"Tree had: {[(a['filename'], a['size']) for a in tree_attachments]}",
             file=sys.stderr,
         )
@@ -282,50 +284,6 @@ def _guess_mime(binary: bytes) -> str:
     if binary[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     return "application/octet-stream"
-
-
-def download_attachment(
-    user_id: str,
-    alias: str,
-    message_id: str,
-    attachment_id: str,
-    filename: str,
-    save_dir: Optional[str] = None,
-) -> dict:
-    """Fetch attachment bytes, decode, write to disk. Returns path + size."""
-    service = get_gmail_service(user_id, alias)
-
-    result = (
-        service.users()
-        .messages()
-        .attachments()
-        .get(userId="me", messageId=message_id, id=attachment_id)
-        .execute()
-    )
-
-    data = result.get("data", "")
-    if not data:
-        raise RuntimeError(
-            "Attachment returned no data. The attachment_id may be invalid or the attachment may be empty."
-        )
-
-    padded = data + "=" * (-len(data) % 4)
-    binary = base64.urlsafe_b64decode(padded)
-
-    safe_name = os.path.basename(filename).strip()
-    if not safe_name or safe_name in (".", ".."):
-        raise ValueError("filename is invalid after sanitization.")
-
-    target_dir = Path(save_dir).expanduser().resolve() if save_dir else Path.cwd()
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / safe_name
-    target_path.write_bytes(binary)
-
-    return {
-        "path": str(target_path),
-        "filename": safe_name,
-        "size_bytes": len(binary),
-    }
 
 
 def create_draft(
