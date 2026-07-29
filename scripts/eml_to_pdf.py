@@ -14,6 +14,7 @@ Requires PyMuPDF (pip install pymupdf).
 """
 from __future__ import annotations
 
+import datetime
 import email
 import email.policy
 import html as html_mod
@@ -180,40 +181,64 @@ def headers_html(msg) -> str:
     )
 
 
-def build_html(msg, workdir: Path) -> tuple[str, list]:
+def account_identity(msg) -> tuple[str, str]:
+    """(account address, mail-domain label) — mirrors Gmail's print header."""
+    acct = ""
+    for h in ("Delivered-To", "X-Original-To", "To"):
+        v = dec(msg.get(h, ""))
+        if v:
+            m = re.search(r"[\w.+-]+@[\w.-]+", v)
+            if m:
+                acct = m.group(0)
+                break
+    domain = acct.split("@", 1)[1] if "@" in acct else ""
+    return acct, domain
+
+
+def build_html(msg, workdir: Path) -> tuple[str, list, dict]:
     html_body, text_body, inline_parts, attach_parts = pick_bodies(msg)
     cid_map = stage_inline_images(inline_parts, workdir)
 
     subject = dec(msg.get("Subject", "")) or "(no subject)"
     date_raw = msg.get("Date", "")
     try:
-        date_disp = parsedate_to_datetime(date_raw).strftime("%A, %d %B %Y  %H:%M %Z").strip()
+        dt = parsedate_to_datetime(date_raw)
+        date_disp = dt.strftime("%a, %b %d, %Y at %I:%M %p").replace(" 0", " ")
     except Exception:
         date_disp = date_raw
 
-    rows = [("From", dec(msg.get("From", ""))), ("To", dec(msg.get("To", "")))]
-    if msg.get("Cc"):
-        rows.append(("Cc", dec(msg.get("Cc"))))
-    rows.append(("Date", date_disp))
+    acct, domain = account_identity(msg)
 
+    # --- print-style header block, laid out like Gmail's own print view ---
     head = [
-        f'<h2 style="margin:0 0 10px 0;font-family:sans-serif;font-size:15pt">{esc(subject)}</h2>',
-        '<table style="font-family:sans-serif;font-size:9.5pt;margin-bottom:6px">',
+        f'<p style="font-family:sans-serif;font-size:10pt;text-align:right;'
+        f'margin:0 0 2px 0"><b>{esc(acct)}</b></p>',
+        '<hr style="border:none;border-top:1px solid #ccc;margin:0 0 10px 0"/>',
+        f'<p style="font-family:sans-serif;font-size:14pt;font-weight:bold;'
+        f'margin:0 0 2px 0">{esc(subject)}</p>',
+        '<p style="font-family:sans-serif;font-size:8.5pt;color:#666;'
+        'margin:0 0 12px 0">1 message</p>',
+        f'<p style="font-family:sans-serif;font-size:9.5pt;margin:0 0 1px 0">'
+        f'<b>{esc(dec(msg.get("From", "")))}</b></p>',
+        f'<p style="font-family:sans-serif;font-size:9.5pt;color:#444;margin:0 0 1px 0">'
+        f'To: {esc(dec(msg.get("To", "")))}</p>',
     ]
-    for k, v in rows:
+    if msg.get("Cc"):
         head.append(
-            f'<tr><td style="color:#666;padding-right:10px;vertical-align:top"><b>{k}</b></td>'
-            f'<td>{esc(v)}</td></tr>'
+            f'<p style="font-family:sans-serif;font-size:9.5pt;color:#444;margin:0 0 1px 0">'
+            f'Cc: {esc(dec(msg.get("Cc")))}</p>'
         )
-    head.append("</table>")
-
+    head.append(
+        f'<p style="font-family:sans-serif;font-size:9.5pt;color:#444;margin:0 0 6px 0">'
+        f'{esc(date_disp)}</p>'
+    )
     if attach_parts:
         names = ", ".join(esc(dec(p.get_filename() or "attachment")) for p in attach_parts)
         head.append(
-            f'<p style="font-family:sans-serif;font-size:9pt;color:#444;margin:2px 0 8px 0">'
-            f'<b>Attachments ({len(attach_parts)}):</b> {names}</p>'
+            f'<p style="font-family:sans-serif;font-size:8.5pt;color:#444;margin:2px 0 6px 0">'
+            f'<b>{len(attach_parts)} attachment(s):</b> {names}</p>'
         )
-    head.append('<hr style="border:none;border-top:1px solid #bbb;margin:8px 0 12px 0"/>')
+    head.append('<hr style="border:none;border-top:1px solid #ccc;margin:6px 0 12px 0"/>')
 
     if html_body:
         body = clean_html(html_body, cid_map)
@@ -221,7 +246,53 @@ def build_html(msg, workdir: Path) -> tuple[str, list]:
         body = (f'<div style="font-family:sans-serif;font-size:10pt;white-space:pre-wrap">'
                 f'{esc(text_body)}</div>')
 
-    return "".join(head) + body, attach_parts
+    meta = {
+        "subject": subject,
+        "account": acct,
+        "domain": domain,
+        "message_id": (msg.get("Message-ID") or "").strip("<> "),
+    }
+    return "".join(head) + body, attach_parts, meta
+
+
+def _fit(text: str, size: float, width: float) -> str:
+    """Trim with an ellipsis so a running-header line never overruns its slot."""
+    if fitz.get_text_length(text, "helv", size) <= width:
+        return text
+    while text and fitz.get_text_length(text + "…", "helv", size) > width:
+        text = text[:-1]
+    return text + "…"
+
+
+def stamp_pages(pdf_path: Path, meta: dict) -> None:
+    """Draw the running header / footer, the way a printed email page carries them."""
+    now = datetime.datetime.now()
+    printed = f"{now.month}/{now.day}/{now.strftime('%y')}, {now.strftime('%I:%M %p').lstrip('0')}"
+    label = f"{meta['domain']} Mail - {meta['subject']}" if meta.get("domain") \
+        else f"Mail - {meta['subject']}"
+    src = f"Message-ID: {meta['message_id']}" if meta.get("message_id") else ""
+
+    doc = fitz.open(str(pdf_path))
+    total = doc.page_count
+    for i, page in enumerate(doc, start=1):
+        w = page.rect.width
+        page.insert_text((54, 40), printed, fontname="helv", fontsize=7.5,
+                         color=(0.35, 0.35, 0.35))
+        txt = _fit(label, 7.5, w - 250)
+        page.insert_text((w - 54 - fitz.get_text_length(txt, "helv", 7.5), 40),
+                         txt, fontname="helv", fontsize=7.5, color=(0.35, 0.35, 0.35))
+        if src:
+            page.insert_text((54, page.rect.height - 34),
+                             _fit(src, 6.5, w - 160), fontname="helv", fontsize=6.5,
+                             color=(0.45, 0.45, 0.45))
+        num = f"{i}/{total}"
+        page.insert_text((w - 54 - fitz.get_text_length(num, "helv", 7.5),
+                          page.rect.height - 34),
+                         num, fontname="helv", fontsize=7.5, color=(0.45, 0.45, 0.45))
+    # incremental save writes back into the same file, so there is no rename to
+    # lose to a Windows file lock
+    doc.save(str(pdf_path), incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+    doc.close()
 
 
 def convert(eml_path: Path, pdf_path: Path, save_attachments: bool = False,
@@ -231,14 +302,14 @@ def convert(eml_path: Path, pdf_path: Path, save_attachments: bool = False,
 
     with tempfile.TemporaryDirectory(prefix="eml2pdf_") as td:
         workdir = Path(td)
-        doc_html, attach_parts = build_html(msg, workdir)
+        doc_html, attach_parts, meta = build_html(msg, workdir)
         if with_headers:
             doc_html += headers_html(msg)
 
         story = fitz.Story(html=doc_html, archive=fitz.Archive(str(workdir)))
         writer = fitz.DocumentWriter(str(pdf_path))
         mediabox = fitz.paper_rect("letter")
-        where = mediabox + (54, 54, -54, -54)
+        where = mediabox + (54, 74, -54, -58)    # room for running header/footer
 
         pages, more = 0, 1
         while more:
@@ -250,6 +321,8 @@ def convert(eml_path: Path, pdf_path: Path, save_attachments: bool = False,
             if pages > 400:                     # runaway guard
                 break
         writer.close()
+
+    stamp_pages(pdf_path, meta)
 
     saved = 0
     if save_attachments and attach_parts:
