@@ -50,6 +50,7 @@ from .models import (
     AuthenticateInput,
     DownloadAttachmentInput,
     DraftEmailInput,
+    ExportEmailInput,
     ListLabelsInput,
     ModifyEmailInput,
     ReadAttachmentInput,
@@ -690,7 +691,102 @@ async def gmail_download_attachment(
 
 
 # ---------------------------------------------------------------------------
-# Tool 10: gmail_read_attachment
+# Tool 10: gmail_export_email
+# ---------------------------------------------------------------------------
+
+def _ensure_eml_ext(name: str) -> str:
+    safe = _safe_filename(name)
+    return safe if safe.lower().endswith(".eml") else f"{safe}.eml"
+
+
+@mcp.tool(
+    name="gmail_export_email",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def gmail_export_email(
+    account: str,
+    message_id: str,
+    filename: str = "",
+) -> str:
+    """
+    Export a whole email as a .eml file (RFC 822) — the complete original
+    message: every header, the plain-text AND HTML bodies, inline images and
+    all attachments, byte-for-byte as it was received.
+
+    Use this to archive a message, hand it to another mail client, keep it as a
+    record, or as the source for converting an email to PDF. Unlike
+    gmail_read_email (which returns a readable summary), this preserves the
+    message exactly, so nothing is lost.
+
+    Returns a direct, time-limited download link (valid ~1 hour). Fetch that URL
+    to retrieve the bytes.
+
+    (When the server runs locally in stdio mode, the file is written straight
+    into your Downloads folder instead and the local path is returned.)
+
+    Args:
+        account: Account alias.
+        message_id: Email message ID (from gmail_search_emails or gmail_read_email).
+        filename: Optional override. A .eml extension is added if missing.
+    """
+    try:
+        validated = ExportEmailInput(
+            account=account,
+            message_id=message_id,
+            filename=filename or None,
+        )
+        user_id = _get_user_id()
+        err = validate_account_alias(validated.account, _user_accounts_dict(user_id))
+        if err:
+            return err
+
+        info = gmail_client.export_email_raw(
+            user_id=user_id,
+            alias=validated.account,
+            message_id=validated.message_id,
+        )
+        binary = info["binary"]
+        fname = _ensure_eml_ext(validated.filename or info["filename"])
+
+        if TRANSPORT == "stdio":
+            path = _save_to_local_downloads(binary, fname)
+            lines = [
+                "## Email Exported (.eml)",
+                "",
+                f"**Saved to:** `{path}`",
+                f"**Subject:**  {info['subject']}",
+                f"**Date:**     {info['date'] or '(unknown)'}",
+                f"**Size:**     {format_size(info['size_bytes'])}",
+            ]
+            return "\n".join(lines)
+
+        result = _persist_for_download(user_id, binary, fname, info["mime_type"])
+        lines = [
+            "## Email Exported (.eml)",
+            "",
+            f"**Filename:** {result['filename']}",
+            f"**Subject:**  {info['subject']}",
+            f"**Date:**     {info['date'] or '(unknown)'}",
+            f"**Size:**     {format_size(info['size_bytes'])}",
+            "",
+            f"**Download link:** {result['url']}",
+            "",
+            "_Open the link in a browser to save the file (valid ~1 hour). "
+            "If you're an automated client, fetch that URL directly to retrieve the bytes. "
+            "The .eml opens in Outlook/Thunderbird/Apple Mail, and can be converted to PDF._",
+        ]
+        return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {e}"
+    except RuntimeError as e:
+        return str(e)
+    except Exception as e:
+        log(f"gmail_export_email error: {e}")
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 11: gmail_read_attachment
 # ---------------------------------------------------------------------------
 
 @mcp.tool(

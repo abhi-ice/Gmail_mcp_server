@@ -188,6 +188,25 @@ class DownloadAttachmentInput(BaseModel):
     )
 
 
+class ExportEmailInput(BaseModel):
+    account: str = Field(
+        ...,
+        description="Account alias.",
+    )
+    message_id: str = Field(
+        ...,
+        min_length=1,
+        description="Email message ID (from gmail_search_emails or gmail_read_email).",
+    )
+    filename: Optional[str] = Field(
+        None,
+        max_length=255,
+        description="Optional filename for the .eml file. If omitted, one is built "
+                    "from the message date and subject. Path components are stripped "
+                    "for safety and a .eml extension is enforced.",
+    )
+
+
 class ReadAttachmentInput(BaseModel):
     account: str = Field(
         ...,

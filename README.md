@@ -65,6 +65,8 @@ Same snippet for every user. No token. No env vars.
 | `gmail_search_emails` | Gmail query syntax search |
 | `gmail_read_email` | Body + headers + attachment metadata (with attachment IDs) |
 | `gmail_download_attachment` | Download attachment bytes (PDF, DOCX, etc.) to disk |
+| `gmail_read_attachment` | Read attachment content inline as text (PDF/DOCX/XLSX/CSV…) |
+| `gmail_export_email` | Export the whole email as `.eml` (RFC 822) — full headers, bodies and attachments |
 | `gmail_draft_email` | Create draft (never sends) |
 | `gmail_modify_email` | Trash, archive, label, star, mark read/unread |
 | `gmail_list_labels` | List labels with counts |

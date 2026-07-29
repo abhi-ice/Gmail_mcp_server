@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import sys
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -107,6 +108,102 @@ def read_email(user_id: str, alias: str, message_id: str) -> dict:
         "body": extract_body(payload),
         "attachments": extract_attachment_info(payload),
         "threadId": msg.get("threadId", ""),
+    }
+
+
+def _decode_header_value(value: str) -> str:
+    """RFC 2047 -> readable text (subjects are often =?UTF-8?B?...?= encoded)."""
+    from email.header import decode_header, make_header
+
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def _eml_meta(binary: bytes) -> tuple[str, str]:
+    """Pull (subject, YYYY-MM-DD) straight out of the RFC 822 bytes.
+
+    Parsing locally avoids a second Gmail API round-trip just to name the file.
+    """
+    import email as _email
+    from email.utils import parsedate_to_datetime
+
+    try:
+        msg = _email.message_from_bytes(binary)
+    except Exception:
+        return "(no subject)", ""
+
+    subject = _decode_header_value(msg.get("Subject", "")).strip() or "(no subject)"
+    stamp = ""
+    raw_date = msg.get("Date", "")
+    if raw_date:
+        try:
+            stamp = parsedate_to_datetime(raw_date).strftime("%Y-%m-%d")
+        except Exception:
+            stamp = ""
+    return subject, stamp
+
+
+def _eml_filename(subject: str, stamp: str) -> str:
+    """Build a filesystem-safe '<date> <subject>.eml' name."""
+    base = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", subject)
+    base = re.sub(r"\s+", " ", base).strip(" .")[:120].strip()
+    if not base:
+        base = "email"
+    return f"{stamp} {base}.eml" if stamp else f"{base}.eml"
+
+
+def export_email_raw(user_id: str, alias: str, message_id: str) -> dict:
+    """
+    Fetch a message as RFC 822 (.eml) — the complete original email: every
+    header, both the plain-text and HTML bodies, inline images and all
+    attachments, byte-for-byte as it was received.
+
+    Gmail returns this via format="raw" as base64url text, which we decode back
+    into the real .eml bytes. A generous ceiling (MAX_ATTACHMENT_MB) guards the
+    container against a pathologically large message.
+
+    Returns dict: {filename, mime_type, size_bytes, binary, subject, date}.
+    """
+    from .config import MAX_ATTACHMENT_MB
+
+    service = get_gmail_service(user_id, alias)
+
+    msg = (
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="raw")
+        .execute()
+    )
+
+    raw = msg.get("raw") or ""
+    if not raw:
+        raise RuntimeError(
+            "Gmail returned no raw content for this message. "
+            "Confirm the message_id is correct and belongs to this account."
+        )
+
+    binary = base64.urlsafe_b64decode(raw.encode("ascii"))
+
+    ceiling = MAX_ATTACHMENT_MB * 1024 * 1024
+    if len(binary) > ceiling:
+        raise RuntimeError(
+            f"Message is {len(binary) / 1024 / 1024:.1f} MB, over the "
+            f"{MAX_ATTACHMENT_MB} MB server ceiling. Raise "
+            f"GMAIL_MCP_MAX_ATTACHMENT_MB if you need larger exports."
+        )
+
+    subject, stamp = _eml_meta(binary)
+    return {
+        "filename": _eml_filename(subject, stamp),
+        "mime_type": "message/rfc822",
+        "size_bytes": len(binary),
+        "binary": binary,
+        "subject": subject,
+        "date": stamp,
     }
 
 
