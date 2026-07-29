@@ -119,6 +119,67 @@ def clean_html(body: str, cid_map: dict) -> str:
     return re.sub(r"<img\b[^>]*>", fix_img, body, flags=re.I)
 
 
+def auth_summary(msg) -> list[tuple[str, str]]:
+    """Pull SPF/DKIM/DMARC verdicts out of Authentication-Results."""
+    blob = " ".join(str(v) for v in (msg.get_all("Authentication-Results") or []))
+    blob += " " + " ".join(str(v) for v in (msg.get_all("ARC-Authentication-Results") or []))
+    out = []
+    for mech in ("spf", "dkim", "dmarc"):
+        m = re.search(rf"\b{mech}=(\w+)", blob, re.I)
+        if m:
+            out.append((mech.upper(), m.group(1).lower()))
+    if msg.get("DKIM-Signature"):
+        d = re.search(r"d=([^;\s]+)", str(msg.get("DKIM-Signature")))
+        if d:
+            out.append(("DKIM domain", d.group(1)))
+    return out
+
+
+def _chunk(s: str, n: int = 96) -> list[str]:
+    """Hard-split a long unbreakable token so the layout engine can place it.
+
+    DKIM/ARC signatures are ~400 chars of unbroken base64 with no space to wrap
+    on; without this the story engine can never fit a line and loops forever.
+    """
+    return [s[i:i + n] for i in range(0, len(s), n)] or [""]
+
+
+def headers_html(msg) -> str:
+    """Verbatim header block — the part that actually evidences authenticity."""
+    blocks = []
+    for k, v in msg.items():
+        val = re.sub(r"\s+", " ", str(v)).strip()
+        parts = _chunk(val)
+        blocks.append(
+            f'<div style="font-family:monospace;font-size:7pt;margin:0 0 1px 0">'
+            f'<b>{esc(k)}:</b> {esc(parts[0])}</div>'
+        )
+        for extra in parts[1:]:
+            blocks.append(
+                f'<div style="font-family:monospace;font-size:7pt;'
+                f'margin:0 0 1px 14px;color:#333">{esc(extra)}</div>'
+            )
+
+    auth = auth_summary(msg)
+    banner = ""
+    if auth:
+        cells = " &nbsp;&nbsp; ".join(f"<b>{esc(k)}</b>: {esc(v)}" for k, v in auth)
+        banner = (
+            f'<p style="font-family:sans-serif;font-size:8.5pt;color:#222;'
+            f'margin:0 0 8px 0">Authentication results &mdash; {cells}</p>'
+        )
+
+    return (
+        '<h3 style="font-family:sans-serif;font-size:11pt;margin:18px 0 4px 0">'
+        'Original message headers (as received)</h3>'
+        '<p style="font-family:sans-serif;font-size:8pt;color:#666;margin:0 0 8px 0">'
+        'Reproduced verbatim from the exported .eml. The DKIM / SPF / ARC entries below '
+        'are what establish that this message is authentic and unmodified.</p>'
+        + banner
+        + "".join(blocks)
+    )
+
+
 def build_html(msg, workdir: Path) -> tuple[str, list]:
     html_body, text_body, inline_parts, attach_parts = pick_bodies(msg)
     cid_map = stage_inline_images(inline_parts, workdir)
@@ -163,13 +224,16 @@ def build_html(msg, workdir: Path) -> tuple[str, list]:
     return "".join(head) + body, attach_parts
 
 
-def convert(eml_path: Path, pdf_path: Path, save_attachments: bool = False) -> tuple[int, int]:
+def convert(eml_path: Path, pdf_path: Path, save_attachments: bool = False,
+            with_headers: bool = True) -> tuple[int, int]:
     raw = eml_path.read_bytes()
     msg = email.message_from_bytes(raw, policy=email.policy.default)
 
     with tempfile.TemporaryDirectory(prefix="eml2pdf_") as td:
         workdir = Path(td)
         doc_html, attach_parts = build_html(msg, workdir)
+        if with_headers:
+            doc_html += headers_html(msg)
 
         story = fitz.Story(html=doc_html, archive=fitz.Archive(str(workdir)))
         writer = fitz.DocumentWriter(str(pdf_path))
@@ -207,6 +271,7 @@ def convert(eml_path: Path, pdf_path: Path, save_attachments: bool = False) -> t
 def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     save_att = "--save-attachments" in sys.argv
+    with_headers = "--no-headers" not in sys.argv
     if not args:
         sys.exit(__doc__)
 
@@ -217,7 +282,7 @@ def main() -> None:
             sys.exit(f"No .eml files in {target}")
         for e in emls:
             try:
-                pages, saved = convert(e, e.with_suffix(".pdf"), save_att)
+                pages, saved = convert(e, e.with_suffix(".pdf"), save_att, with_headers)
                 extra = f", {saved} attachment(s)" if saved else ""
                 print(f"  {e.name}  ->  {e.with_suffix('.pdf').name}  ({pages} page(s){extra})")
             except Exception as ex:
@@ -227,7 +292,7 @@ def main() -> None:
     if not target.exists():
         sys.exit(f"Not found: {target}")
     out = Path(args[1]) if len(args) > 1 else target.with_suffix(".pdf")
-    pages, saved = convert(target, out, save_att)
+    pages, saved = convert(target, out, save_att, with_headers)
     extra = f", {saved} attachment(s) saved" if saved else ""
     print(f"{target.name} -> {out}  ({pages} page(s){extra})")
 
