@@ -67,12 +67,27 @@ Same snippet for every user. No token. No env vars.
 | `gmail_download_attachment` | Download attachment bytes (PDF, DOCX, etc.) to disk |
 | `gmail_read_attachment` | Read attachment content inline as text (PDF/DOCX/XLSX/CSV…) |
 | `gmail_export_email` | Export the whole email as `.eml` (RFC 822) — full headers, bodies and attachments |
-| `gmail_draft_email` | Create draft (never sends) |
+| `gmail_draft_email` | Create draft, with optional file attachments (never sends) |
+| `gmail_send_email` | Send immediately, with optional file attachments — cannot be recalled |
 | `gmail_modify_email` | Trash, archive, label, star, mark read/unread |
 | `gmail_list_labels` | List labels with counts |
 | `gmail_search_contacts` | Google People API search |
 
 All tools take an `account` parameter — the alias of one of *your* connected Gmails. Default after sign-in is `account="primary"`.
+
+### Outbound mail
+
+`gmail_draft_email` and `gmail_send_email` take the same arguments and build the
+same MIME message — they differ only in which Gmail endpoint they hit.
+
+- `attachments` — list of absolute paths to local files. Anything the server can
+  read on its own filesystem. Combined size is capped at ~24 MB, because Gmail
+  rejects messages over ~25 MB once base64-encoded.
+- `html_body` — optional HTML alternative. When set, the message goes out as
+  `multipart/alternative` and `body` becomes the plain-text fallback.
+
+Note that in a hosted deployment `attachments` paths resolve on the *server*, not
+on the machine running the MCP client.
 
 ---
 

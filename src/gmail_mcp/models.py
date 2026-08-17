@@ -107,6 +107,20 @@ class DraftEmailInput(BaseModel):
         None,
         description="If this is a reply, provide the original message ID to set proper threading headers (In-Reply-To, References, threadId).",
     )
+    attachments: Optional[list[str]] = Field(
+        None,
+        max_length=25,
+        description="Absolute paths to local files to attach. Combined size must stay under ~25 MB.",
+    )
+    html_body: Optional[str] = Field(
+        None,
+        description="Optional HTML version of the body. When set, the message is multipart/alternative and 'body' is the plain-text fallback.",
+    )
+
+
+class SendEmailInput(DraftEmailInput):
+    """Same shape as a draft — sending is the same message, a different endpoint."""
+    pass
 
 
 class EmailAction(str, Enum):

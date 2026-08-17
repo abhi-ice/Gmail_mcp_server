@@ -6,9 +6,13 @@ Every public function takes (user_id, alias). Auth is per-user.
 from __future__ import annotations
 
 import base64
+import mimetypes
 import os
 import re
 import sys
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
@@ -383,6 +387,121 @@ def _guess_mime(binary: bytes) -> str:
     return "application/octet-stream"
 
 
+# ---------------------------------------------------------------------------
+# Outbound mail: shared MIME builder (used by both draft and send)
+# ---------------------------------------------------------------------------
+
+# Gmail rejects messages over 25 MB once base64-encoded. Encoding inflates by
+# ~4/3, so cap the raw payload below that to fail here with a clear message
+# rather than getting an opaque 400 back from the API.
+MAX_OUTBOUND_ATTACHMENT_BYTES = 24 * 1024 * 1024
+
+
+def _attach_file(msg: MIMEMultipart, path: Path) -> int:
+    """Attach one file to msg. Returns its size in bytes."""
+    data = path.read_bytes()
+    ctype, encoding = mimetypes.guess_type(str(path))
+    if ctype is None or encoding is not None:
+        ctype = "application/octet-stream"
+    maintype, subtype = ctype.split("/", 1)
+
+    part = MIMEBase(maintype, subtype)
+    part.set_payload(data)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename=path.name)
+    msg.attach(part)
+    return len(data)
+
+
+def _build_outbound_message(
+    to: str,
+    subject: str,
+    body: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    attachments: Optional[list[str]] = None,
+    html_body: Optional[str] = None,
+):
+    """
+    Build a MIME message. Plain MIMEText when there is nothing to attach and no
+    HTML alternative, MIMEMultipart otherwise — Gmail is happier with a simple
+    single-part message when multipart buys nothing.
+    """
+    paths: list[Path] = []
+    for raw_path in (attachments or []):
+        p = Path(raw_path).expanduser()
+        if not p.exists():
+            raise ValueError(f"Attachment not found: {p}")
+        if not p.is_file():
+            raise ValueError(f"Attachment is not a file: {p}")
+        paths.append(p)
+
+    if not paths and not html_body:
+        msg = MIMEText(body, "plain", "utf-8")
+    else:
+        msg = MIMEMultipart("mixed")
+        if html_body:
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(body, "plain", "utf-8"))
+            alt.attach(MIMEText(html_body, "html", "utf-8"))
+            msg.attach(alt)
+        else:
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        total = 0
+        for p in paths:
+            total += _attach_file(msg, p)
+        if total > MAX_OUTBOUND_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"Attachments total {total / 1024 / 1024:.1f} MB, over Gmail's ~25 MB "
+                f"per-message ceiling. Send fewer or smaller files, or link them instead."
+            )
+
+    msg["To"] = to
+    msg["Subject"] = subject
+    if cc:
+        msg["Cc"] = cc
+    if bcc:
+        msg["Bcc"] = bcc
+    return msg
+
+
+def _apply_threading(service, msg, reply_to_message_id: Optional[str]) -> Optional[str]:
+    """Set In-Reply-To/References on msg. Returns the thread id, if any."""
+    if not reply_to_message_id:
+        return None
+    try:
+        original = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=reply_to_message_id,
+                format="metadata",
+                metadataHeaders=["Message-ID", "Subject", "References"],
+            )
+            .execute()
+        )
+        orig_headers = format_email_headers(original.get("payload", {}).get("headers", []))
+        orig_message_id = orig_headers.get("Message-ID", "")
+        orig_references = orig_headers.get("References", "")
+
+        if orig_message_id:
+            msg["In-Reply-To"] = orig_message_id
+            msg["References"] = (
+                f"{orig_references} {orig_message_id}".strip()
+                if orig_references
+                else orig_message_id
+            )
+        return original.get("threadId")
+    except Exception as e:
+        print(
+            f"[gmail-mcp] Warning: could not fetch original message for threading: {e}",
+            file=sys.stderr,
+        )
+        return None
+
+
 def create_draft(
     user_id: str,
     alias: str,
@@ -392,50 +511,13 @@ def create_draft(
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     reply_to_message_id: Optional[str] = None,
+    attachments: Optional[list[str]] = None,
+    html_body: Optional[str] = None,
 ) -> dict:
     service = get_gmail_service(user_id, alias)
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["To"] = to
-    msg["Subject"] = subject
-    if cc:
-        msg["Cc"] = cc
-    if bcc:
-        msg["Bcc"] = bcc
-
-    thread_id: Optional[str] = None
-
-    if reply_to_message_id:
-        try:
-            original = (
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=reply_to_message_id,
-                    format="metadata",
-                    metadataHeaders=["Message-ID", "Subject", "References"],
-                )
-                .execute()
-            )
-            orig_headers = format_email_headers(original.get("payload", {}).get("headers", []))
-            orig_message_id = orig_headers.get("Message-ID", "")
-            orig_references = orig_headers.get("References", "")
-            thread_id = original.get("threadId")
-
-            if orig_message_id:
-                msg["In-Reply-To"] = orig_message_id
-                references = (
-                    f"{orig_references} {orig_message_id}".strip()
-                    if orig_references
-                    else orig_message_id
-                )
-                msg["References"] = references
-        except Exception as e:
-            print(
-                f"[gmail-mcp] Warning: could not fetch original message for threading: {e}",
-                file=sys.stderr,
-            )
+    msg = _build_outbound_message(to, subject, body, cc, bcc, attachments, html_body)
+    thread_id = _apply_threading(service, msg, reply_to_message_id)
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
     draft_body: dict = {"message": {"raw": raw}}
@@ -448,6 +530,38 @@ def create_draft(
         "draft_id": result.get("id", ""),
         "message_id": result.get("message", {}).get("id", ""),
         "thread_id": result.get("message", {}).get("threadId", ""),
+    }
+
+
+def send_message(
+    user_id: str,
+    alias: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
+    attachments: Optional[list[str]] = None,
+    html_body: Optional[str] = None,
+) -> dict:
+    """Send an email immediately. Unlike create_draft this cannot be undone."""
+    service = get_gmail_service(user_id, alias)
+
+    msg = _build_outbound_message(to, subject, body, cc, bcc, attachments, html_body)
+    thread_id = _apply_threading(service, msg, reply_to_message_id)
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    send_body: dict = {"raw": raw}
+    if thread_id:
+        send_body["threadId"] = thread_id
+
+    result = service.users().messages().send(userId="me", body=send_body).execute()
+
+    return {
+        "message_id": result.get("id", ""),
+        "thread_id": result.get("threadId", ""),
+        "label_ids": result.get("labelIds", []),
     }
 
 

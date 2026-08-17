@@ -57,6 +57,7 @@ from .models import (
     ReadEmailInput,
     SearchContactsInput,
     SearchEmailsInput,
+    SendEmailInput,
 )
 from .utils import extract_attachment_text, format_size, handle_api_error, validate_account_alias
 
@@ -326,8 +327,10 @@ async def gmail_draft_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
+    attachments: list[str] | None = None,
+    html_body: str = "",
 ) -> str:
-    """Create an email draft. Never sends — appears in Gmail Drafts for manual review."""
+    """Create an email draft, optionally with file attachments. Never sends — appears in Gmail Drafts for manual review."""
     try:
         validated = DraftEmailInput(
             account=account,
@@ -337,6 +340,8 @@ async def gmail_draft_email(
             cc=cc if cc else None,
             bcc=bcc if bcc else None,
             reply_to_message_id=reply_to_message_id if reply_to_message_id else None,
+            attachments=attachments or None,
+            html_body=html_body if html_body else None,
         )
         user_id = _get_user_id()
         err = validate_account_alias(validated.account, _user_accounts_dict(user_id))
@@ -352,6 +357,8 @@ async def gmail_draft_email(
             cc=validated.cc,
             bcc=validated.bcc,
             reply_to_message_id=validated.reply_to_message_id,
+            attachments=validated.attachments,
+            html_body=validated.html_body,
         )
 
         account_info = storage.get_account(user_id, validated.account)
@@ -371,6 +378,10 @@ async def gmail_draft_email(
         lines.append(f"**Subject:**    {validated.subject}")
         if result.get("thread_id"):
             lines.append(f"**Thread ID:**  `{result['thread_id']}`")
+        if validated.attachments:
+            lines.append(f"**Attached:**   {len(validated.attachments)} file(s)")
+            for a in validated.attachments:
+                lines.append(f"  - {os.path.basename(a)}")
         lines.append("")
         lines.append("The draft has been saved. Open Gmail to review and send.")
         return "\n".join(lines)
@@ -380,6 +391,90 @@ async def gmail_draft_email(
         return str(e)
     except Exception as e:
         log(f"gmail_draft_email error: {e}")
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Tool 5b: gmail_send_email
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="gmail_send_email",
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def gmail_send_email(
+    account: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    reply_to_message_id: str = "",
+    attachments: list[str] | None = None,
+    html_body: str = "",
+) -> str:
+    """Send an email immediately, optionally with file attachments.
+
+    This SENDS — it cannot be recalled. For anything going to more than one
+    recipient, or any message the user has not read back verbatim, prefer
+    gmail_draft_email and let the user press send in Gmail.
+    """
+    try:
+        validated = SendEmailInput(
+            account=account,
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc if cc else None,
+            bcc=bcc if bcc else None,
+            reply_to_message_id=reply_to_message_id if reply_to_message_id else None,
+            attachments=attachments or None,
+            html_body=html_body if html_body else None,
+        )
+        user_id = _get_user_id()
+        err = validate_account_alias(validated.account, _user_accounts_dict(user_id))
+        if err:
+            return err
+
+        result = gmail_client.send_message(
+            user_id=user_id,
+            alias=validated.account,
+            to=validated.to,
+            subject=validated.subject,
+            body=validated.body,
+            cc=validated.cc,
+            bcc=validated.bcc,
+            reply_to_message_id=validated.reply_to_message_id,
+            attachments=validated.attachments,
+            html_body=validated.html_body,
+        )
+
+        account_info = storage.get_account(user_id, validated.account)
+        sender_email = account_info["email"] if account_info else validated.account
+
+        lines = [
+            "## Email Sent",
+            "",
+            f"**Message ID:** `{result['message_id']}`",
+            f"**From:**       {sender_email}",
+            f"**To:**         {validated.to}",
+        ]
+        if validated.cc:
+            lines.append(f"**Cc:**         {validated.cc}")
+        if validated.bcc:
+            lines.append(f"**Bcc:**        {validated.bcc}")
+        lines.append(f"**Subject:**    {validated.subject}")
+        if validated.attachments:
+            lines.append(f"**Attached:**   {len(validated.attachments)} file(s)")
+            for a in validated.attachments:
+                lines.append(f"  - {os.path.basename(a)}")
+        return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {e}"
+    except RuntimeError as e:
+        return str(e)
+    except Exception as e:
+        log(f"gmail_send_email error: {e}")
         return handle_api_error(e)
 
 
