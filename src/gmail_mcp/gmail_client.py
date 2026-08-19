@@ -6,6 +6,7 @@ Every public function takes (user_id, alias). Auth is per-user.
 from __future__ import annotations
 
 import base64
+import binascii
 import mimetypes
 import os
 import re
@@ -397,20 +398,127 @@ def _guess_mime(binary: bytes) -> str:
 MAX_OUTBOUND_ATTACHMENT_BYTES = 24 * 1024 * 1024
 
 
-def _attach_file(msg: MIMEMultipart, path: Path) -> int:
-    """Attach one file to msg. Returns its size in bytes."""
-    data = path.read_bytes()
-    ctype, encoding = mimetypes.guess_type(str(path))
-    if ctype is None or encoding is not None:
-        ctype = "application/octet-stream"
-    maintype, subtype = ctype.split("/", 1)
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+URL_FETCH_TIMEOUT_SECONDS = 20
 
+
+def _sniff_ctype(filename: str, explicit: Optional[str]) -> str:
+    """Pick a MIME type: explicit if given, else guess from the filename."""
+    if explicit:
+        return explicit
+    ctype, encoding = mimetypes.guess_type(filename)
+    if ctype is None or encoding is not None:
+        return "application/octet-stream"
+    return ctype
+
+
+def _safe_attachment_name(filename: str) -> str:
+    """Reduce a supplied filename to a bare, path-separator-free name."""
+    name = os.path.basename((filename or "").strip().replace("\\", "/"))
+    if not name or name in (".", ".."):
+        raise ValueError(f"Attachment has an invalid filename: {filename!r}")
+    return name
+
+
+def _attach_bytes(msg: MIMEMultipart, filename: str, data: bytes, ctype: str) -> None:
+    """Attach raw bytes to msg with the given filename and content type."""
+    maintype, _, subtype = (ctype or "").partition("/")
+    if not maintype or not subtype:
+        maintype, subtype = "application", "octet-stream"
     part = MIMEBase(maintype, subtype)
     part.set_payload(data)
     encoders.encode_base64(part)
-    part.add_header("Content-Disposition", "attachment", filename=path.name)
+    part.add_header("Content-Disposition", "attachment", filename=filename)
     msg.attach(part)
-    return len(data)
+
+
+def _filename_from_content_disposition(cd: Optional[str]) -> Optional[str]:
+    if not cd:
+        return None
+    m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", cd, re.IGNORECASE)
+    return os.path.basename(m.group(1).strip()) if m else None
+
+
+def _filename_from_url(url: str) -> str:
+    from urllib.parse import urlparse, unquote
+    name = os.path.basename(unquote(urlparse(url).path or ""))
+    return name or "attachment.bin"
+
+
+def _fetch_url_attachment(url: str) -> tuple[str, bytes, str]:
+    """Fetch an http(s) URL into (filename, bytes, mime_type) with a size cap."""
+    import httpx
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=URL_FETCH_TIMEOUT_SECONDS) as client:
+            resp = client.get(url, headers={"User-Agent": "gmail-mcp"})
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as e:
+        raise ValueError(f"Could not fetch attachment URL {url}: {e}")
+
+    if len(data) > MAX_OUTBOUND_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"Attachment at {url} is {len(data) / 1024 / 1024:.1f} MB, over Gmail's "
+            f"~25 MB per-message ceiling."
+        )
+    filename = _safe_attachment_name(
+        _filename_from_content_disposition(resp.headers.get("content-disposition"))
+        or _filename_from_url(url)
+    )
+    header_ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
+    return filename, data, _sniff_ctype(filename, header_ctype or None)
+
+
+def _resolve_attachment_item(item) -> tuple[str, bytes, str]:
+    """
+    Normalize one attachments[] entry to (filename, data, mime_type).
+
+    Accepts three forms:
+      • inline by value  — an AttachmentSpec or {filename, content_base64, mime_type?}
+      • an http(s):// URL — fetched by the server
+      • a string path     — read from the server's OWN filesystem (local/stdio only)
+    """
+    # --- inline by value (AttachmentSpec instance or a plain dict) ---
+    if isinstance(item, dict):
+        filename, content_b64, mime_type = (
+            item.get("filename"),
+            item.get("content_base64"),
+            item.get("mime_type"),
+        )
+    else:
+        filename = getattr(item, "filename", None)
+        content_b64 = getattr(item, "content_base64", None)
+        mime_type = getattr(item, "mime_type", None)
+
+    if not isinstance(item, str) and (content_b64 is not None or filename is not None):
+        name = _safe_attachment_name(filename or "")
+        if not content_b64:
+            raise ValueError(f"Attachment '{name}' is missing 'content_base64'.")
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"Attachment '{name}' has invalid base64 content: {e}")
+        return name, data, _sniff_ctype(name, mime_type)
+
+    # --- string: URL or a path on the server's filesystem ---
+    if isinstance(item, str):
+        if _URL_RE.match(item):
+            return _fetch_url_attachment(item)
+        p = Path(item).expanduser()
+        if not p.exists():
+            raise ValueError(
+                f"Attachment not found: {p}\n"
+                f"The server resolves string paths inside its own container "
+                f"(cwd={os.getcwd()}) and cannot read files from the calling machine. "
+                f"To attach a file from the caller, pass an object instead: "
+                f'{{"filename": "<name>", "content_base64": "<base64>"}}.'
+            )
+        if not p.is_file():
+            raise ValueError(f"Attachment is not a file: {p}")
+        return p.name, p.read_bytes(), _sniff_ctype(p.name, None)
+
+    raise ValueError(f"Unsupported attachment entry: {item!r}")
 
 
 def _build_outbound_message(
@@ -427,16 +535,13 @@ def _build_outbound_message(
     HTML alternative, MIMEMultipart otherwise — Gmail is happier with a simple
     single-part message when multipart buys nothing.
     """
-    paths: list[Path] = []
-    for raw_path in (attachments or []):
-        p = Path(raw_path).expanduser()
-        if not p.exists():
-            raise ValueError(f"Attachment not found: {p}")
-        if not p.is_file():
-            raise ValueError(f"Attachment is not a file: {p}")
-        paths.append(p)
+    # Resolve every entry up front (path / URL / inline base64) so a bad one
+    # fails before we start building the message.
+    resolved: list[tuple[str, bytes, str]] = [
+        _resolve_attachment_item(item) for item in (attachments or [])
+    ]
 
-    if not paths and not html_body:
+    if not resolved and not html_body:
         msg = MIMEText(body, "plain", "utf-8")
     else:
         msg = MIMEMultipart("mixed")
@@ -448,14 +553,14 @@ def _build_outbound_message(
         else:
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        total = 0
-        for p in paths:
-            total += _attach_file(msg, p)
+        total = sum(len(data) for _, data, _ in resolved)
         if total > MAX_OUTBOUND_ATTACHMENT_BYTES:
             raise ValueError(
                 f"Attachments total {total / 1024 / 1024:.1f} MB, over Gmail's ~25 MB "
                 f"per-message ceiling. Send fewer or smaller files, or link them instead."
             )
+        for name, data, ctype in resolved:
+            _attach_bytes(msg, name, data, ctype)
 
     msg["To"] = to
     msg["Subject"] = subject

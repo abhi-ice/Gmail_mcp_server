@@ -1,7 +1,7 @@
 """Pydantic input models for all Gmail MCP tools."""
 
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -75,6 +75,40 @@ class ReadEmailInput(BaseModel):
     )
 
 
+class AttachmentSpec(BaseModel):
+    """
+    An attachment supplied by value (inline base64), for callers whose files do
+    not live on the server's own filesystem. This is the deployment-independent
+    way to attach: the bytes travel in the request, so it works from any client.
+    """
+    filename: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="Filename for the attachment part, used verbatim in the email. "
+        "Must be a bare name with no path separators.",
+    )
+    content_base64: str = Field(
+        ...,
+        description="Base64-encoded file content (standard base64; padding optional).",
+    )
+    mime_type: Optional[str] = Field(
+        None,
+        description="MIME type, e.g. 'application/pdf'. Sniffed from the filename "
+        "extension when omitted; falls back to application/octet-stream.",
+    )
+
+    @field_validator("filename")
+    @classmethod
+    def _no_path_separators(cls, v: str) -> str:
+        v = v.strip()
+        if not v or v in (".", "..") or "/" in v or "\\" in v or "\x00" in v:
+            raise ValueError(
+                f"filename must be a bare name with no path separators (got {v!r})"
+            )
+        return v
+
+
 class DraftEmailInput(BaseModel):
     account: str = Field(
         ...,
@@ -107,10 +141,19 @@ class DraftEmailInput(BaseModel):
         None,
         description="If this is a reply, provide the original message ID to set proper threading headers (In-Reply-To, References, threadId).",
     )
-    attachments: Optional[list[str]] = Field(
+    attachments: Optional[list[Union[str, AttachmentSpec]]] = Field(
         None,
         max_length=25,
-        description="Absolute paths to local files to attach. Combined size must stay under ~25 MB.",
+        description=(
+            "Files to attach (max 25). Each item is one of:\n"
+            "  • an object {\"filename\": ..., \"content_base64\": ..., \"mime_type\"?: ...} "
+            "— attach a file BY VALUE. Use this when the file lives on the calling "
+            "machine; it is the only form that works from a remote client.\n"
+            "  • an 'http(s)://' URL the server fetches (with a timeout and size cap).\n"
+            "  • a string path to a file on the SERVER's OWN filesystem (only useful "
+            "for a local stdio deployment).\n"
+            "Combined decoded size must stay under Gmail's ~25 MB per-message ceiling."
+        ),
     )
     html_body: Optional[str] = Field(
         None,

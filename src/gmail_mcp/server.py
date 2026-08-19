@@ -47,6 +47,7 @@ from .config import (
 )
 from .middleware import OAuthAccessTokenMiddleware
 from .models import (
+    AttachmentSpec,
     AuthenticateInput,
     DownloadAttachmentInput,
     DraftEmailInput,
@@ -311,6 +312,19 @@ async def gmail_read_email(account: str, message_id: str) -> str:
         return handle_api_error(e)
 
 
+def _attachment_label(a) -> str:
+    """Display name for one attachments[] entry (string path/URL or object)."""
+    if isinstance(a, str):
+        if a.lower().startswith(("http://", "https://")):
+            from urllib.parse import urlparse
+            return os.path.basename(urlparse(a).path) or a
+        return os.path.basename(a)
+    name = getattr(a, "filename", None)
+    if name is None and isinstance(a, dict):
+        name = a.get("filename")
+    return name or "attachment"
+
+
 # ---------------------------------------------------------------------------
 # Tool 5: gmail_draft_email
 # ---------------------------------------------------------------------------
@@ -327,7 +341,7 @@ async def gmail_draft_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
-    attachments: list[str] | None = None,
+    attachments: list[str | AttachmentSpec] | None = None,
     html_body: str = "",
 ) -> str:
     """Create an email draft, optionally with file attachments. Never sends — appears in Gmail Drafts for manual review."""
@@ -381,7 +395,7 @@ async def gmail_draft_email(
         if validated.attachments:
             lines.append(f"**Attached:**   {len(validated.attachments)} file(s)")
             for a in validated.attachments:
-                lines.append(f"  - {os.path.basename(a)}")
+                lines.append(f"  - {_attachment_label(a)}")
         lines.append("")
         lines.append("The draft has been saved. Open Gmail to review and send.")
         return "\n".join(lines)
@@ -410,7 +424,7 @@ async def gmail_send_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
-    attachments: list[str] | None = None,
+    attachments: list[str | AttachmentSpec] | None = None,
     html_body: str = "",
 ) -> str:
     """Send an email immediately, optionally with file attachments.
@@ -467,7 +481,7 @@ async def gmail_send_email(
         if validated.attachments:
             lines.append(f"**Attached:**   {len(validated.attachments)} file(s)")
             for a in validated.attachments:
-                lines.append(f"  - {os.path.basename(a)}")
+                lines.append(f"  - {_attachment_label(a)}")
         return "\n".join(lines)
     except ValueError as e:
         return f"Invalid input: {e}"

@@ -80,14 +80,24 @@ All tools take an `account` parameter — the alias of one of *your* connected G
 `gmail_draft_email` and `gmail_send_email` take the same arguments and build the
 same MIME message — they differ only in which Gmail endpoint they hit.
 
-- `attachments` — list of absolute paths to local files. Anything the server can
-  read on its own filesystem. Combined size is capped at ~24 MB, because Gmail
-  rejects messages over ~25 MB once base64-encoded.
+- `attachments` — a list (max 25). Each item is one of:
+  - **`{ "filename": ..., "content_base64": ..., "mime_type"?: ... }`** — attach a
+    file *by value*. The bytes travel in the request, so this works from any
+    client regardless of where the server runs. `filename` must be a bare name
+    (no path separators); `mime_type` is sniffed from the extension when omitted.
+    **Use this form from a hosted deployment** — it is the only one that can
+    attach a file living on the calling machine.
+  - **`"https://…"`** — a URL the server fetches (with a timeout and size cap),
+    deriving the filename from `Content-Disposition` or the URL.
+  - **`"/path/on/server"`** — a path on the *server's own* filesystem. Only useful
+    for a local stdio deployment; in a hosted deployment these resolve on the
+    server, not on the client machine, and a missing path returns an error that
+    points you to the `content_base64` form.
+
+  Combined decoded size is capped at ~24 MB, because Gmail rejects messages over
+  ~25 MB once base64-encoded.
 - `html_body` — optional HTML alternative. When set, the message goes out as
   `multipart/alternative` and `body` becomes the plain-text fallback.
-
-Note that in a hosted deployment `attachments` paths resolve on the *server*, not
-on the machine running the MCP client.
 
 ---
 
