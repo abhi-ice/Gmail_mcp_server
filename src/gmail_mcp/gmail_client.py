@@ -23,6 +23,7 @@ from .auth import (
     resolve_label_ids_to_names,
     resolve_label_names_to_ids,
 )
+from .config import MAX_OUTBOUND_ATTACHMENT_MB
 from .utils import (
     extract_attachment_info,
     extract_body,
@@ -392,10 +393,27 @@ def _guess_mime(binary: bytes) -> str:
 # Outbound mail: shared MIME builder (used by both draft and send)
 # ---------------------------------------------------------------------------
 
-# Gmail rejects messages over 25 MB once base64-encoded. Encoding inflates by
-# ~4/3, so cap the raw payload below that to fail here with a clear message
-# rather than getting an opaque 400 back from the API.
-MAX_OUTBOUND_ATTACHMENT_BYTES = 24 * 1024 * 1024
+# Combined decoded-attachment ceiling. Gmail delivers direct attachments up to
+# ~25 MB; beyond that its UI switches to a Drive (cloud) link, which this server
+# does not do. Default 25 MB, override with GMAIL_MCP_MAX_OUTBOUND_MB. A 25 MB
+# payload becomes a ~33 MB MIME message, under the Gmail API's 35 MB limit.
+MAX_OUTBOUND_ATTACHMENT_BYTES = MAX_OUTBOUND_ATTACHMENT_MB * 1024 * 1024
+
+# Below this MIME size we inline the base64 message in the JSON request (simple,
+# proven). Above it the Gmail API rejects the oversized inline request, so we
+# hand the message to the media-upload endpoint instead — this is what allows
+# attachments up to the full ~25 MB ceiling to actually go out.
+INLINE_RAW_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _media_upload(mime_bytes: bytes):
+    """Wrap a raw RFC822 message as a Gmail media upload (for large messages)."""
+    import io
+    from googleapiclient.http import MediaIoBaseUpload
+
+    return MediaIoBaseUpload(
+        io.BytesIO(mime_bytes), mimetype="message/rfc822", resumable=False
+    )
 
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -624,12 +642,18 @@ def create_draft(
     msg = _build_outbound_message(to, subject, body, cc, bcc, attachments, html_body)
     thread_id = _apply_threading(service, msg, reply_to_message_id)
 
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    draft_body: dict = {"message": {"raw": raw}}
-    if thread_id:
-        draft_body["message"]["threadId"] = thread_id
+    mime_bytes = msg.as_bytes()
+    message: dict = {"threadId": thread_id} if thread_id else {}
+    if len(mime_bytes) > INLINE_RAW_MAX_BYTES:
+        # Large message → media upload so the request isn't rejected for size.
+        request = service.users().drafts().create(
+            userId="me", body={"message": message}, media_body=_media_upload(mime_bytes)
+        )
+    else:
+        message["raw"] = base64.urlsafe_b64encode(mime_bytes).decode("utf-8")
+        request = service.users().drafts().create(userId="me", body={"message": message})
 
-    result = service.users().drafts().create(userId="me", body=draft_body).execute()
+    result = request.execute()
 
     return {
         "draft_id": result.get("id", ""),
@@ -656,12 +680,18 @@ def send_message(
     msg = _build_outbound_message(to, subject, body, cc, bcc, attachments, html_body)
     thread_id = _apply_threading(service, msg, reply_to_message_id)
 
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    send_body: dict = {"raw": raw}
-    if thread_id:
-        send_body["threadId"] = thread_id
+    mime_bytes = msg.as_bytes()
+    send_body: dict = {"threadId": thread_id} if thread_id else {}
+    if len(mime_bytes) > INLINE_RAW_MAX_BYTES:
+        # Large message → media upload so the request isn't rejected for size.
+        request = service.users().messages().send(
+            userId="me", body=send_body, media_body=_media_upload(mime_bytes)
+        )
+    else:
+        send_body["raw"] = base64.urlsafe_b64encode(mime_bytes).decode("utf-8")
+        request = service.users().messages().send(userId="me", body=send_body)
 
-    result = service.users().messages().send(userId="me", body=send_body).execute()
+    result = request.execute()
 
     return {
         "message_id": result.get("id", ""),

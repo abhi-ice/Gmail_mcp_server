@@ -94,8 +94,10 @@ same MIME message — they differ only in which Gmail endpoint they hit.
     server, not on the client machine, and a missing path returns an error that
     points you to the `content_base64` form.
 
-  Combined decoded size is capped at ~24 MB, because Gmail rejects messages over
-  ~25 MB once base64-encoded.
+  Combined decoded size is capped at ~25 MB — Gmail's direct-attachment ceiling
+  (beyond that Gmail's UI switches to a Drive/cloud link; this server does not).
+  Large messages are streamed to Gmail via a media upload so files up to that
+  ceiling actually send. Override the cap with `GMAIL_MCP_MAX_OUTBOUND_MB`.
 - `html_body` — optional HTML alternative. When set, the message goes out as
   `multipart/alternative` and `body` becomes the plain-text fallback.
 

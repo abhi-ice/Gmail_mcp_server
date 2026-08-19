@@ -75,6 +75,12 @@ DOWNLOAD_TOKEN_TTL_SECONDS = int(_get("GMAIL_MCP_DOWNLOAD_TTL", "3600") or "3600
 # for real mail while still protecting the container from an OOM.
 MAX_ATTACHMENT_MB = int(_get("GMAIL_MCP_MAX_ATTACHMENT_MB", "75") or "75")
 
+# Ceiling on combined OUTBOUND attachment bytes (decoded) for send/draft. Gmail
+# delivers direct attachments up to ~25 MB; larger normally becomes a Drive
+# (cloud) link, which this server does not do. Raise deliberately only if your
+# recipients accept larger messages (the Gmail API itself caps a message at 35 MB).
+MAX_OUTBOUND_ATTACHMENT_MB = int(_get("GMAIL_MCP_MAX_OUTBOUND_MB", "25") or "25")
+
 # Cap on how many characters of EXTRACTED TEXT gmail_read_attachment returns
 # inline. Protects the model context on huge docs; the full file is always
 # available via gmail_download_attachment. 0 = unlimited.
