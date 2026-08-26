@@ -16,7 +16,9 @@ import os
 import secrets
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
+
+from pydantic import Field
 
 from urllib.parse import quote, urlparse
 
@@ -312,6 +314,17 @@ async def gmail_read_email(account: str, message_id: str) -> str:
         return handle_api_error(e)
 
 
+_ATTACHMENTS_DESC = (
+    "Optional files to attach (max 25). Each list item is one of: "
+    '(1) an object {"filename": str, "content_base64": str, "mime_type"?: str} to attach a '
+    "file BY VALUE — use this when the file is on the CALLING machine; it is the only form "
+    "that works from a remote/hosted client; "
+    "(2) an 'http(s)://' URL the server fetches; or "
+    "(3) a string path to a file on the SERVER's own filesystem (local/stdio deployments only). "
+    "Combined size up to ~25 MB. Works identically for drafting and sending."
+)
+
+
 def _attachment_label(a) -> str:
     """Display name for one attachments[] entry (string path/URL or object)."""
     if isinstance(a, str):
@@ -341,7 +354,9 @@ async def gmail_draft_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
-    attachments: list[str | AttachmentSpec] | None = None,
+    attachments: Annotated[
+        list[str | AttachmentSpec] | None, Field(description=_ATTACHMENTS_DESC)
+    ] = None,
     html_body: str = "",
 ) -> str:
     """Create an email draft, optionally with file attachments. Never sends — appears in Gmail Drafts for manual review."""
@@ -424,7 +439,9 @@ async def gmail_send_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
-    attachments: list[str | AttachmentSpec] | None = None,
+    attachments: Annotated[
+        list[str | AttachmentSpec] | None, Field(description=_ATTACHMENTS_DESC)
+    ] = None,
     html_body: str = "",
 ) -> str:
     """Send an email immediately, optionally with file attachments.
