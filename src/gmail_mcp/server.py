@@ -49,7 +49,6 @@ from .config import (
 )
 from .middleware import OAuthAccessTokenMiddleware
 from .models import (
-    AttachmentSpec,
     AuthenticateInput,
     DownloadAttachmentInput,
     DraftEmailInput,
@@ -315,13 +314,15 @@ async def gmail_read_email(account: str, message_id: str) -> str:
 
 
 _ATTACHMENTS_DESC = (
-    "Optional files to attach (max 25). Each list item is one of: "
-    '(1) an object {"filename": str, "content_base64": str, "mime_type"?: str} to attach a '
-    "file BY VALUE — use this when the file is on the CALLING machine; it is the only form "
-    "that works from a remote/hosted client; "
-    "(2) an 'http(s)://' URL the server fetches; or "
-    "(3) a string path to a file on the SERVER's own filesystem (local/stdio deployments only). "
-    "Combined size up to ~25 MB. Works identically for drafting and sending."
+    "Files to attach (max 25 files, ~25 MB total — Gmail's hard limit). "
+    "TO ATTACH A FILE FROM THE USER'S COMPUTER (the normal case): read the file's "
+    'bytes, base64-encode them, and pass an object {"filename": "name.ext", '
+    '"content_base64": "<base64>", "mime_type"?: "..."}. Do NOT pass a local file '
+    "path string — this server runs remotely and cannot see the caller's filesystem, "
+    "so a path will fail with 'Attachment not found'. "
+    "Each list item may instead be an 'http(s)://' URL (the server downloads it), or a "
+    "path on the SERVER's own filesystem (only for a local stdio deployment). "
+    "Identical for gmail_draft_email and gmail_send_email."
 )
 
 
@@ -354,9 +355,7 @@ async def gmail_draft_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
-    attachments: Annotated[
-        list[str | AttachmentSpec] | None, Field(description=_ATTACHMENTS_DESC)
-    ] = None,
+    attachments: Annotated[Optional[list], Field(description=_ATTACHMENTS_DESC)] = None,
     html_body: str = "",
 ) -> str:
     """Create an email draft, optionally with file attachments. Never sends — appears in Gmail Drafts for manual review."""
@@ -439,9 +438,7 @@ async def gmail_send_email(
     cc: str = "",
     bcc: str = "",
     reply_to_message_id: str = "",
-    attachments: Annotated[
-        list[str | AttachmentSpec] | None, Field(description=_ATTACHMENTS_DESC)
-    ] = None,
+    attachments: Annotated[Optional[list], Field(description=_ATTACHMENTS_DESC)] = None,
     html_body: str = "",
 ) -> str:
     """Send an email immediately, optionally with file attachments.

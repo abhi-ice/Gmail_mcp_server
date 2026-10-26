@@ -575,7 +575,8 @@ def _build_outbound_message(
         if total > MAX_OUTBOUND_ATTACHMENT_BYTES:
             raise ValueError(
                 f"Attachments total {total / 1024 / 1024:.1f} MB, over Gmail's ~25 MB "
-                f"per-message ceiling. Send fewer or smaller files, or link them instead."
+                f"per-message hard limit (Google rejects larger messages). For bigger "
+                f"files, upload to Drive and paste a share link in the body instead."
             )
         for name, data, ctype in resolved:
             _attach_bytes(msg, name, data, ctype)
