@@ -606,9 +606,14 @@ def _apply_threading(service, msg, reply_to_message_id: Optional[str]) -> Option
             )
             .execute()
         )
-        orig_headers = format_email_headers(original.get("payload", {}).get("headers", []))
-        orig_message_id = orig_headers.get("Message-ID", "")
-        orig_references = orig_headers.get("References", "")
+        # Header names are case-insensitive (RFC 5322); Gmail stores mail sent
+        # through the API as "Message-Id", so look them up case-blind.
+        orig_headers = {
+            k.lower(): v
+            for k, v in format_email_headers(original.get("payload", {}).get("headers", [])).items()
+        }
+        orig_message_id = orig_headers.get("message-id", "")
+        orig_references = orig_headers.get("references", "")
 
         if orig_message_id:
             msg["In-Reply-To"] = orig_message_id
